@@ -116,7 +116,7 @@ async fn play_file(
     let codec = CodecType::OpusMusic;
     let mut current_volume = volume;
 
-    let ytdl_url = match Command::new("youtube-dl")
+    let ytdl_url = match Command::new("yt-dlp")
         .args(&[&link, "--get-url"])
         .stdout(Stdio::piped())
         .output()
@@ -125,7 +125,7 @@ async fn play_file(
             if let Err(e) = pkt_send.send(AudioPacket::None).await {
                 error!("Status packet sending error: {}", e);
             }
-            panic!("couldn't spawn youtube-dl: {}", why);
+            panic!("couldn't spawn yt-dlp: {}", why);
         }
         Ok(process) => process,
     };
@@ -254,12 +254,12 @@ async fn real_main() -> Result<()> {
         exit(-1);
     };
 
-    if let Err(why) = Command::new("youtube-dl")
+    if let Err(why) = Command::new("yt-dlp")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     {
-        error!("Unable to execute youtube-dl: {}", why);
+        error!("Unable to execute yt-dlp: {}", why);
         exit(-1);
     };
 
