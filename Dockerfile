@@ -16,7 +16,7 @@ FROM alpine:latest as final
 
 # Switch to root
 USER root
-RUN apk add --update --no-cache ffmpeg youtube-dl opus
+RUN apk add --update --no-cache ffmpeg yt-dlp opus
 
 # Set user and group
 ARG user=bot
