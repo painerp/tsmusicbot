@@ -28,14 +28,20 @@ struct Config {
 #[derive(Debug)]
 enum Action {
     PlayAudio(String),
-    PlayNukedAudio(String),
+    QueueNextAudio(String),
+    Skip,
+    Pause,
+    Resume,
     Stop,
     ChangeVolume { modifier: f32 },
+    Help,
     None,
 }
 
 #[derive(Debug)]
 enum PlayTaskCmd {
+    Pause,
+    Resume,
     Stop,
     ChangeVolume { modifier: f32 },
 }
@@ -51,8 +57,8 @@ fn sanitize(s: &str) -> String {
         .filter(|c| {
             c.is_alphanumeric()
                 || [
-                    ' ', '.', ' ', '=', '\t', ',', '?', '!', ':', '&', '/', '_',
-                ]
+                ' ', '.', ' ', '=', '\t', ',', '?', '!', ':', '&', '/', '_',
+            ]
                 .contains(c)
         })
         .collect()
@@ -68,7 +74,7 @@ fn parse_command(msg: &str) -> Action {
 
     let split_vec: Vec<&str> = sanitized.split(' ').collect();
 
-    if split_vec[0] == "!stop" {
+    if split_vec[0] == "!stop" || split_vec[0] == "!s" {
         return Action::Stop;
     }
 
@@ -76,7 +82,7 @@ fn parse_command(msg: &str) -> Action {
         return Action::None;
     }
 
-    if split_vec[0] == "!volume" {
+    if split_vec[0] == "!volume" || split_vec[0] == "!v" {
         let amount = split_vec[1].parse::<u32>();
         match amount {
             Err(_) => {
@@ -89,14 +95,33 @@ fn parse_command(msg: &str) -> Action {
         };
     }
 
-    if split_vec[0] == "!yt" {
+    if split_vec[0] == "!yt" || split_vec[0] == "!play" {
         trace!("MSG: {}", split_vec[1]);
         return Action::PlayAudio(split_vec[1].to_string());
     }
 
-    if split_vec[0] == "!brki" {
-        trace!("MSG: {}", split_vec[1]);
-        return Action::PlayNukedAudio(split_vec[1].to_string());
+    if split_vec[0] == "!pause" || split_vec[0] == "!pa" {
+        return Action::Pause;
+    }
+
+    if split_vec[0] == "!continue" || split_vec[0] == "!c" || split_vec[0] == "!resume" || split_vec[0] == "!r" {
+        return Action::Resume;
+    }
+
+    if split_vec[0] == "!next" || split_vec[0] == "!n" {
+        if split_vec.len() > 1 {
+            trace!("MSG: {}", split_vec[1]);
+            return Action::QueueNextAudio(split_vec[1].to_string());
+        }
+        return Action::Skip;
+    }
+
+    if split_vec[0] == "!skip" || split_vec[0] == "!sk" {
+        return Action::Skip;
+    }
+
+    if split_vec[0] == "!help" || split_vec[0] == "!h" {
+        return Action::Help;
     }
 
     Action::None
@@ -115,6 +140,7 @@ async fn play_file(
 
     let codec = CodecType::OpusMusic;
     let mut current_volume = volume;
+    let mut paused = false;
 
     let ytdl_url = match Command::new("yt-dlp")
         .args(&[&link, "--get-url"])
@@ -195,7 +221,18 @@ async fn play_file(
             Some(PlayTaskCmd::Stop) => {
                 break;
             }
+            Some(PlayTaskCmd::Pause) => {
+                paused = true;
+            }
+            Some(PlayTaskCmd::Resume) => {
+                paused = false;
+            }
         };
+
+        if paused {
+            sleep(Duration::from_millis(500)).await;
+            continue;
+        }
 
         if ffmpeg_stdout
             .read_i16_into::<BigEndian>(&mut pcm_in_be)
@@ -316,6 +353,7 @@ async fn real_main() -> Result<()> {
     let (pkt_send, mut pkt_recv) = mpsc::channel(64);
     let (status_send, mut status_recv) = mpsc::channel(64);
     let mut playing: bool = false;
+    let mut paused: bool = false;
 
     let (mut cmd_send, _cmd_recv) = mpsc::channel(4);
     let mut play_queue: VecDeque<String> = VecDeque::new();
@@ -353,10 +391,11 @@ async fn real_main() -> Result<()> {
                     },
                     Some(action) => {
                         match action {
-                            Action::PlayAudio(link) | Action::PlayNukedAudio(link) => {
+                            Action::PlayAudio(link) => {
                                 trace!("RECV");
-                                if !playing{
+                                if !playing {
                                     playing = true;
+                                    paused = false;
                                     let audio_task_pkt_send = pkt_send.clone();
 
                                     let (task_cmd_send,  task_cmd_recv) = mpsc::channel(4);
@@ -373,8 +412,39 @@ async fn real_main() -> Result<()> {
                             Action::ChangeVolume {modifier} => {
                                 if playing { let _ = cmd_send.send(PlayTaskCmd::ChangeVolume {modifier}).await; };
                             },
+                            Action::QueueNextAudio(link) => {
+                                if playing {
+                                    play_queue.push_front(link);
+                                } else {
+                                    Action::PlayAudio(link);
+                                }
+                            },
+                            Action::Skip => {
+                                if playing {
+                                    paused = false;
+                                    let _ = cmd_send.send(PlayTaskCmd::Stop).await;
+                                };
+                            },
+                            Action::Resume => {
+                                if playing && paused {
+                                    paused = false;
+                                    let _ = cmd_send.send(PlayTaskCmd::Resume).await;
+                                };
+                            },
+                            Action::Pause => {
+                                if playing && !paused {
+                                    paused = true;
+                                    let _ = cmd_send.send(PlayTaskCmd::Pause).await;
+                                };
+                            },
                             Action::Stop => {
-                                if playing{ let _ = cmd_send.send(PlayTaskCmd::Stop).await;};
+                                if playing {
+                                    paused = false;
+                                    play_queue.clear();
+                                    let _ = cmd_send.send(PlayTaskCmd::Stop).await;
+                                };
+                            },
+                            Action::Help => {
                             }
                             _ => {},
                         }
