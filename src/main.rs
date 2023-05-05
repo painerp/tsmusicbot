@@ -1,7 +1,7 @@
 use anyhow::{bail, Result};
 use byteorder::{BigEndian, ReadBytesExt};
 use futures::prelude::*;
-use log::{error, info, trace};
+use log::{error, info, debug};
 use serde::Deserialize;
 use std::collections::VecDeque;
 use std::process::{exit, Command, Stdio};
@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
 use tsclientlib::events::Event;
-use tsclientlib::{Connection, DisconnectOptions, Identity, StreamItem};
+use tsclientlib::{ClientId, Connection, DisconnectOptions, Identity, MessageTarget, OutCommandExt, StreamItem};
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
 
 extern crate audiopus;
@@ -34,7 +34,9 @@ enum Action {
     Resume,
     Stop,
     ChangeVolume { modifier: f32 },
-    Help,
+    Info(ClientId),
+    Help(ClientId),
+    Quit,
     None,
 }
 
@@ -64,7 +66,7 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
-fn parse_command(msg: &str) -> Action {
+fn parse_command(msg: &str, user_id: ClientId) -> Action {
     let stripped = msg.replace("[URL]", "").replace("[/URL]", "");
     let sanitized = sanitize(&stripped).trim().to_string();
 
@@ -78,29 +80,7 @@ fn parse_command(msg: &str) -> Action {
         return Action::Stop;
     }
 
-    if split_vec.len() < 2 {
-        return Action::None;
-    }
-
-    if split_vec[0] == "!volume" || split_vec[0] == "!v" {
-        let amount = split_vec[1].parse::<u32>();
-        match amount {
-            Err(_) => {
-                return Action::None;
-            }
-            Ok(num) => {
-                let modifier: f32 = num.max(0).min(100) as f32 / 100_f32;
-                return Action::ChangeVolume { modifier };
-            }
-        };
-    }
-
-    if split_vec[0] == "!yt" || split_vec[0] == "!play" {
-        trace!("MSG: {}", split_vec[1]);
-        return Action::PlayAudio(split_vec[1].to_string());
-    }
-
-    if split_vec[0] == "!pause" || split_vec[0] == "!pa" {
+    if split_vec[0] == "!pause" || split_vec[0] == "!p" {
         return Action::Pause;
     }
 
@@ -110,7 +90,7 @@ fn parse_command(msg: &str) -> Action {
 
     if split_vec[0] == "!next" || split_vec[0] == "!n" {
         if split_vec.len() > 1 {
-            trace!("MSG: {}", split_vec[1]);
+            debug!("MSG: {}", split_vec[1]);
             return Action::QueueNextAudio(split_vec[1].to_string());
         }
         return Action::Skip;
@@ -121,7 +101,39 @@ fn parse_command(msg: &str) -> Action {
     }
 
     if split_vec[0] == "!help" || split_vec[0] == "!h" {
-        return Action::Help;
+        return Action::Help(user_id);
+    }
+
+    if split_vec[0] == "!info" || split_vec[0] == "!i" {
+        return Action::Info(user_id);
+    }
+
+    if split_vec[0] == "!quit" || split_vec[0] == "!q" {
+        return Action::Quit;
+    }
+
+
+    // return if no second argument
+    if split_vec.len() < 2 {
+        return Action::None;
+    }
+
+    if split_vec[0] == "!yt" || split_vec[0] == "!play" {
+        debug!("MSG: {}", split_vec[1]);
+        return Action::PlayAudio(split_vec[1].to_string());
+    }
+
+    if split_vec[0] == "!volume" || split_vec[0] == "!v" {
+        let amount = split_vec[1].parse::<u32>();
+        return match amount {
+            Err(_) => {
+                Action::None
+            }
+            Ok(num) => {
+                let modifier: f32 = num.max(0).min(100) as f32 / 100_f32;
+                Action::ChangeVolume { modifier }
+            }
+        };
     }
 
     Action::None
@@ -266,7 +278,7 @@ async fn play_file(
         sleep(usec_sleep).await;
     }
 
-    info!("Cleanup...");
+    debug!("Cleanup...");
     if let Err(e) = pkt_send.send(AudioPacket::None).await {
         error!("Status packet sending error: {}", e);
         return;
@@ -365,15 +377,14 @@ async fn real_main() -> Result<()> {
                     for msg in msg_vec {
                         match msg {
                             Event::Message {
-                                invoker: _,
+                                invoker: user,
                                 target: _,
                                 message,
                             } => {
-                                if let Err(e) = status_send.send(parse_command(&message)).await {
+                                if let Err(e) = status_send.send(parse_command(&message, user.id)).await {
                                     error!("Status packet sending error: {}", e);
                                 }
                             }
-
                             _ => {}
                         }
                     }
@@ -384,8 +395,7 @@ async fn real_main() -> Result<()> {
         });
 
         tokio::select! {
-
-          val =   status_recv.recv() => {
+            val = status_recv.recv() => {
                 match val {
                     None => {
                     },
@@ -444,8 +454,43 @@ async fn real_main() -> Result<()> {
                                     let _ = cmd_send.send(PlayTaskCmd::Stop).await;
                                 };
                             },
-                            Action::Help => {
-                            }
+                            Action::Info(user_id) => {
+                                debug!("Info");
+                                let mut msg = "\nCurrently Playing:\n".to_owned();
+                                if playing {
+                                    msg += &current_playing_link.clone().unwrap_or_default();
+                                } else {
+                                    msg += &"Nothing".to_owned();
+                                }
+
+                                let state = init_con.get_state().unwrap_or_else(|e| {
+                                    error!("Unable to get state: {}", e);
+                                    exit(-1);
+                                });
+
+                                match state.send_message(MessageTarget::Client(user_id), &msg).send_with_result(&mut init_con) {
+                                    Ok(_) => (),
+                                    Err(e) => error!("Message sending error: {}", e),
+                                };
+                            },
+                            Action::Help(user_id) => {
+                                debug!("Help");
+                                let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link>, !n <link>, !next, or !n - Queue a track as next or skip current track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip or !sk - Skip current track\n!stop or !s - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
+
+                                let state = init_con.get_state().unwrap_or_else(|e| {
+                                    error!("Unable to get state: {}", e);
+                                    exit(-1);
+                                });
+                                if let Err(e) = state.send_message(MessageTarget::Client(user_id), &msg).send_with_result(&mut init_con)
+                                {
+                                    error!("Message sending error: {}", e);
+                                };
+
+                            },
+                            Action::Quit => {
+                                debug!("Quit");
+                                break;
+                            },
                             _ => {},
                         }
                     }
@@ -499,6 +544,7 @@ async fn real_main() -> Result<()> {
 
     // Disconnect
     init_con.disconnect(DisconnectOptions::new())?;
+    init_con.events().for_each(|_| future::ready(())).await;
 
     Ok(())
 }
