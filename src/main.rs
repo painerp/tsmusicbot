@@ -366,6 +366,8 @@ async fn real_main() -> Result<()> {
     let (status_send, mut status_recv) = mpsc::channel(64);
     let mut playing: bool = false;
     let mut paused: bool = false;
+    let mut volume: f32 = DEFAULT_VOLUME;
+    let mut current_playing_link: Option<String> = None;
 
     let (mut cmd_send, _cmd_recv) = mpsc::channel(4);
     let mut play_queue: VecDeque<String> = VecDeque::new();
@@ -402,7 +404,7 @@ async fn real_main() -> Result<()> {
                     Some(action) => {
                         match action {
                             Action::PlayAudio(link) => {
-                                trace!("RECV");
+                                debug!("Playing");
                                 if !playing {
                                     playing = true;
                                     paused = false;
@@ -412,17 +414,21 @@ async fn real_main() -> Result<()> {
 
                                     cmd_send = task_cmd_send;
 
+                                    current_playing_link = Some(link.clone());
                                     tokio::spawn(async move {
-                                        play_file(link, audio_task_pkt_send, task_cmd_recv,  DEFAULT_VOLUME).await;
+                                        play_file(link, audio_task_pkt_send, task_cmd_recv, volume).await;
                                     });
                                 } else {
                                     play_queue.push_back(link);
                                 }
                             },
                             Action::ChangeVolume {modifier} => {
+                                debug!("Change volume");
+                                volume = modifier;
                                 if playing { let _ = cmd_send.send(PlayTaskCmd::ChangeVolume {modifier}).await; };
                             },
                             Action::QueueNextAudio(link) => {
+                                debug!("Queued");
                                 if playing {
                                     play_queue.push_front(link);
                                 } else {
@@ -430,24 +436,28 @@ async fn real_main() -> Result<()> {
                                 }
                             },
                             Action::Skip => {
+                                debug!("Skip");
                                 if playing {
                                     paused = false;
                                     let _ = cmd_send.send(PlayTaskCmd::Stop).await;
                                 };
                             },
                             Action::Resume => {
+                                debug!("Resume");
                                 if playing && paused {
                                     paused = false;
                                     let _ = cmd_send.send(PlayTaskCmd::Resume).await;
                                 };
                             },
                             Action::Pause => {
+                                debug!("Pause");
                                 if playing && !paused {
                                     paused = true;
                                     let _ = cmd_send.send(PlayTaskCmd::Pause).await;
                                 };
                             },
                             Action::Stop => {
+                                debug!("Stop");
                                 if playing {
                                     paused = false;
                                     play_queue.clear();
@@ -497,41 +507,42 @@ async fn real_main() -> Result<()> {
                 }
             }
 
-        val = pkt_recv.recv() => {
-            match val {
-                None => {
-                },
-                Some(msg) => {
-                    if playing{
+            val = pkt_recv.recv() => {
+                match val {
+                    None => {
+                    },
+                    Some(msg) => {
+                        if playing {
 
-                        match msg {
+                            match msg {
+                                AudioPacket::Payload(pkt) =>{
+                                    if let Err(e) = init_con.send_audio(pkt) {
+                                            error!("Audio packet sending error: {}", e);
+                                            break;
+                                    }
+                                },
+                                AudioPacket::None => {
+                                    if play_queue.is_empty(){
+                                        playing = false;
+                                    } else {
+                                        let link = play_queue.pop_front().unwrap();
+                                        let audio_task_pkt_send = pkt_send.clone();
 
-                           AudioPacket::Payload(pkt) =>{
-                    if let Err(e) = init_con.send_audio(pkt) {
-                            error!("Audio packet sending error: {}", e);
-                            break;
-                    }},
-                            AudioPacket::None => {
-                                if play_queue.is_empty(){
-                                    playing = false;
-                                } else {
-                                    let link = play_queue.pop_front().unwrap();
-                                    let audio_task_pkt_send = pkt_send.clone();
+                                        let (task_cmd_send,  task_cmd_recv) = mpsc::channel(4);
 
-                                    let (task_cmd_send,  task_cmd_recv) = mpsc::channel(4);
+                                        cmd_send = task_cmd_send;
 
-                                    cmd_send = task_cmd_send;
-
-                                    tokio::spawn(async move {
-                                        play_file(link, audio_task_pkt_send, task_cmd_recv,  DEFAULT_VOLUME).await;
-                                    });
+                                        current_playing_link = Some(link.clone());
+                                        tokio::spawn(async move {
+                                            play_file(link, audio_task_pkt_send, task_cmd_recv, volume).await;
+                                        });
+                                    }
                                 }
                             }
                         }
                     }
+                }
             }
-            }
-        }
 
             _ = tokio::signal::ctrl_c() => { break; }
             r = events => {
