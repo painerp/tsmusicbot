@@ -239,21 +239,31 @@ async fn play_file(
         };
 
         if paused {
+            debug!("Paused wait...");
             sleep(Duration::from_millis(500)).await;
             continue;
         }
 
-        if ffmpeg_stdout
+        match ffmpeg_stdout
             .read_i16_into::<BigEndian>(&mut pcm_in_be)
-            .is_err()
         {
-            break;
+            Err(e) => {
+                debug!("Error ffmpeg_stdout: {}", e);
+                break;
+            },
+            Ok(_) => {}
         };
 
         for i in 0..FRAME_SIZE * 2 {
             pcm_in_be[i] = (pcm_in_be[i] as f32 * current_volume) as i16;
         }
-        let len = encoder.encode(&pcm_in_be, &mut opus_pkt[..]).unwrap();
+        let len = encoder.encode(&pcm_in_be, &mut opus_pkt[..]).unwrap_or_else(|e| {
+            error!("Encoding error: {}", e);
+            0
+        });
+        if len < 200 || len > 350 {
+            debug!("encoding is: {}", len);
+        }
 
         let packet = OutAudio::new(&AudioData::C2S {
             id: 0,
