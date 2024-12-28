@@ -309,7 +309,7 @@ async fn real_main() -> Result<()> {
         exit(-1);
     };
 
-    let config_file_path = "/opt/tsmusicbot/config.json";
+    let config_file_path = "config.json";
     let config_file = match std::fs::File::open(config_file_path) {
         Ok(id) => id,
         Err(why) => {
