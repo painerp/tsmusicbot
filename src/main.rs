@@ -220,10 +220,7 @@ async fn play_file(
         // start = Instant::now();
 
         let cmd: Option<PlayTaskCmd> =
-            match timeout(Duration::from_micros(1), cmd_recv.recv()).await {
-                Err(_) => None,
-                Ok(msg) => msg,
-            };
+            timeout(Duration::from_micros(1), cmd_recv.recv()).await.unwrap_or_else(|_| None);
 
         match cmd {
             None => {}
@@ -509,16 +506,15 @@ async fn real_main() -> Result<()> {
 
             val = pkt_recv.recv() => {
                 match val {
-                    None => {
-                    },
+                    None => {},
                     Some(msg) => {
                         if playing {
 
                             match msg {
-                                AudioPacket::Payload(pkt) =>{
+                                AudioPacket::Payload(pkt) => {
                                     if let Err(e) = init_con.send_audio(pkt) {
-                                            error!("Audio packet sending error: {}", e);
-                                            break;
+                                        error!("Audio packet sending error: {}", e);
+                                        break;
                                     }
                                 },
                                 AudioPacket::None => {
@@ -546,10 +542,10 @@ async fn real_main() -> Result<()> {
 
             _ = tokio::signal::ctrl_c() => { break; }
             r = events => {
-                        r?;
-                        init_con.disconnect(DisconnectOptions::new())?;
-                        bail!("Disconnected");
-                  }
+                r?;
+                init_con.disconnect(DisconnectOptions::new())?;
+                bail!("Disconnected");
+            }
         };
     }
 
