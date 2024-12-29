@@ -131,7 +131,7 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
     if split_vec[0] == "!next" || split_vec[0] == "!n" {
         if split_vec.len() > 1 {
             info!("Queueing: {} (requested by {})", split_vec[1], user_id);
-            return Action::QueueNextAudio(split_vec[1].to_string());
+            return Action::QueueNextAudio(split_vec[1].to_string(), user_id);
         }
         return Action::Skip;
     }
@@ -160,7 +160,7 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 
     if split_vec[0] == "!yt" || split_vec[0] == "!play" {
         info!("Playing: {} (requested by {})", split_vec[1], user_id);
-        return Action::PlayAudio(split_vec[1].to_string());
+        return Action::PlayAudio(split_vec[1].to_string(), user_id);
     }
 
     if split_vec[0] == "!volume" || split_vec[0] == "!v" {

@@ -45,8 +45,8 @@ struct InfoJson {
 
 #[derive(Debug)]
 enum Action {
-    PlayAudio(String),
-    QueueNextAudio(String),
+    PlayAudio(String, ClientId),
+    QueueNextAudio(String, ClientId),
     Skip,
     Pause,
     Resume,
@@ -302,8 +302,9 @@ async fn real_main() -> Result<()> {
                     },
                     Some(action) => {
                         match action {
-                            Action::PlayAudio(link) => {
+                            Action::PlayAudio(link, user_id) => {
                                 debug!("Playing");
+                                let msg: String;
                                 if !playing {
                                     playing = true;
                                     paused = false;
@@ -317,9 +318,12 @@ async fn real_main() -> Result<()> {
                                     tokio::spawn(async move {
                                         play_file(link, audio_task_pkt_send, task_cmd_recv, volume).await;
                                     });
+                                    msg = "Playing Link".to_string();
                                 } else {
                                     play_queue.push_back(link);
+                                    msg = "Queued Link".to_string();
                                 }
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
                             Action::ChangeVolume {modifier, user_id} => {
                                 debug!("Change volume");
@@ -331,22 +335,15 @@ async fn real_main() -> Result<()> {
                                 } else {
                                     msg = format!("Current Volume: {}", volume);
                                 }
-
-                                let state = init_con.get_state().unwrap_or_else(|e| {
-                                    panic!("Unable to get state: {}", e);
-                                });
-
-                                match state.send_message(MessageTarget::Client(user_id), &msg).send_with_result(&mut init_con) {
-                                    Ok(_) => (),
-                                    Err(e) => error!("Message sending error: {}", e),
-                                };
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
-                            Action::QueueNextAudio(link) => {
+                            Action::QueueNextAudio(link, user_id) => {
                                 debug!("Queued");
                                 if playing {
                                     play_queue.push_front(link);
+                                    send_ts_message(&mut init_con, MessageTarget::Client(user_id), "Queued Link");
                                 } else {
-                                    Action::PlayAudio(link);
+                                    Action::PlayAudio(link, user_id);
                                 }
                             },
                             Action::Skip => {
@@ -394,15 +391,7 @@ async fn real_main() -> Result<()> {
                                 } else {
                                     msg += &"Nothing".to_owned();
                                 }
-
-                                let state = init_con.get_state().unwrap_or_else(|e| {
-                                    panic!("Unable to get state: {}", e);
-                                });
-
-                                match state.send_message(MessageTarget::Client(user_id), &msg).send_with_result(&mut init_con) {
-                                    Ok(_) => (),
-                                    Err(e) => error!("Message sending error: {}", e),
-                                };
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
                             Action::Help(user_id) => {
                                 debug!("Help");
