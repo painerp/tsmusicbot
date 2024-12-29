@@ -5,6 +5,8 @@ extern crate serde_json;
 mod helper;
 
 use anyhow::{bail, Result};
+use axum::extract::State;
+use axum::{routing::get, Router};
 use byteorder::{BigEndian, ReadBytesExt};
 use futures::prelude::*;
 use log::{debug, error, info};
@@ -12,17 +14,17 @@ use serde::Deserialize;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::process::{Command, Stdio};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use std::time::Instant;
+use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::helper::{
-    check_dependencies, cleanup_process, connect_to_ts, parse_command, read_config, read_info_json,
-    send_ts_message,
+    check_dependencies, cleanup_process, connect_to_ts, get_status, parse_command, read_config,
+    read_info_json, send_ts_message,
 };
 use tsclientlib::events::Event;
-use tsclientlib::{
-    ClientId, Connection, DisconnectOptions, MessageTarget, OutCommandExt, StreamItem,
-};
+use tsclientlib::{ClientId, Connection, DisconnectOptions, MessageTarget, StreamItem};
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +74,13 @@ enum AudioPacket {
     None,
 }
 
+#[derive(Clone)]
+struct PlaybackState {
+    time_passed: f64,
+    paused: bool,
+    link: Option<String>,
+}
+
 const DEFAULT_VOLUME: f32 = 0.2;
 
 async fn play_file(
@@ -79,6 +88,7 @@ async fn play_file(
     pkt_send: mpsc::Sender<AudioPacket>,
     mut cmd_recv: mpsc::Receiver<PlayTaskCmd>,
     volume: f32,
+    playback_state: Arc<Mutex<PlaybackState>>,
 ) {
     const FRAME_SIZE: usize = 960;
     const MAX_PACKET_SIZE: usize = 3 * 1276;
@@ -86,6 +96,13 @@ async fn play_file(
     let codec = CodecType::OpusMusic;
     let mut current_volume = volume;
     let mut paused = false;
+    let mut time_passed: f64 = 0.0;
+
+    let mut state = playback_state.lock().await;
+    state.time_passed = time_passed;
+    state.paused = paused;
+    state.link = Some(link.clone());
+    drop(state);
 
     // Extract Audio from Youtube using yt-dlp and pipe the output to stdout
     let mut ytdlp = match Command::new("yt-dlp")
@@ -158,6 +175,8 @@ async fn play_file(
     let ffmpeg_stdout = &mut ffmpeg.stdout.take().unwrap();
 
     loop {
+        let start = Instant::now();
+
         let cmd: Option<PlayTaskCmd> = timeout(Duration::from_micros(1), cmd_recv.recv())
             .await
             .unwrap_or_else(|_| None);
@@ -172,9 +191,15 @@ async fn play_file(
             }
             Some(PlayTaskCmd::Pause) => {
                 paused = true;
+                let mut state = playback_state.lock().await;
+                state.paused = paused;
+                drop(state);
             }
             Some(PlayTaskCmd::Resume) => {
                 paused = false;
+                let mut state = playback_state.lock().await;
+                state.paused = paused;
+                drop(state);
             }
         };
 
@@ -223,6 +248,10 @@ async fn play_file(
         }
 
         sleep(Duration::from_micros(17000)).await;
+        time_passed += start.elapsed().as_millis() as f64 / 1000.0;
+        let mut state = playback_state.lock().await;
+        state.time_passed = time_passed;
+        drop(state);
     }
 
     debug!("Cleanup...");
@@ -268,6 +297,32 @@ async fn real_main() -> Result<()> {
 
     let (mut cmd_send, _cmd_recv) = mpsc::channel(4);
     let mut play_queue: VecDeque<String> = VecDeque::new();
+
+    let playback_state = Arc::new(Mutex::new(PlaybackState {
+        time_passed: 0.0,
+        paused: false,
+        link: None,
+    }));
+
+    let playback_state_clone = Arc::clone(&playback_state);
+    tokio::spawn(async move {
+        let app = Router::new()
+            .route("/", get(|| async { "TSMusicbot is running!" }))
+            .route(
+                "/status",
+                get({
+                    let playback_state_clone = Arc::clone(&playback_state_clone);
+                    move || get_status(State(playback_state_clone))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
+            .await
+            .unwrap_or_else(|e| panic!("Failed to bind to 0.0.0.0:3000: {}", e));
+        axum::serve(listener, app)
+            .await
+            .unwrap_or_else(|e| panic!("Failed to start http server: {}", e));
+    });
 
     loop {
         let events = init_con.events().try_for_each(|e| async {
@@ -315,8 +370,9 @@ async fn real_main() -> Result<()> {
                                     cmd_send = task_cmd_send;
 
                                     current_playing_link = Some(link.clone());
+                                    let playback_state_clone = Arc::clone(&playback_state);
                                     tokio::spawn(async move {
-                                        play_file(link, audio_task_pkt_send, task_cmd_recv, volume).await;
+                                        play_file(link, audio_task_pkt_send, task_cmd_recv, volume, playback_state_clone).await;
                                     });
                                     msg = "Playing Link".to_string();
                                 } else {
@@ -433,8 +489,9 @@ async fn real_main() -> Result<()> {
                                         cmd_send = task_cmd_send;
 
                                         current_playing_link = Some(link.clone());
+                                        let playback_state_clone = Arc::clone(&playback_state);
                                         tokio::spawn(async move {
-                                            play_file(link, audio_task_pkt_send, task_cmd_recv, volume).await;
+                                            play_file(link, audio_task_pkt_send, task_cmd_recv, volume, playback_state_clone).await;
                                         });
                                     }
                                 }

@@ -1,8 +1,13 @@
-use crate::{Action, Config, InfoJson};
+use crate::{Action, Config, InfoJson, PlaybackState};
 use anyhow::{Context, Result};
+use axum::extract::State;
+use axum::Json;
 use log::{error, info};
+use serde_json::json;
 use std::fs::File;
 use std::io::BufReader;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tsclientlib::{ClientId, Connection, Identity, MessageTarget, OutCommandExt};
 use which::which;
 
@@ -186,4 +191,14 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
     }
 
     Action::None
+}
+
+pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<serde_json::Value> {
+    let playback_state = state.lock().await;
+
+    Json(json!({
+        "time": playback_state.time_passed,
+        "paused": playback_state.paused,
+        "link": playback_state.link.clone().unwrap_or_default(),
+    }))
 }
