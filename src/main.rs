@@ -50,7 +50,7 @@ enum Action {
     Pause,
     Resume,
     Stop,
-    ChangeVolume { modifier: f32 },
+    ChangeVolume { modifier: f32, user_id: ClientId },
     Info(ClientId),
     Help(ClientId),
     Quit,
@@ -320,10 +320,25 @@ async fn real_main() -> Result<()> {
                                     play_queue.push_back(link);
                                 }
                             },
-                            Action::ChangeVolume {modifier} => {
+                            Action::ChangeVolume {modifier, user_id} => {
                                 debug!("Change volume");
-                                volume = modifier;
-                                if playing { let _ = cmd_send.send(PlayTaskCmd::ChangeVolume {modifier}).await; };
+                                let msg: String;
+                                if modifier > 0.0 && modifier <= 1.0 {
+                                    volume = modifier;
+                                    if playing { let _ = cmd_send.send(PlayTaskCmd::ChangeVolume {modifier}).await; };
+                                    msg = format!("Volume set to: {}", modifier);
+                                } else {
+                                    msg = format!("Current Volume: {}", volume);
+                                }
+
+                                let state = init_con.get_state().unwrap_or_else(|e| {
+                                    panic!("Unable to get state: {}", e);
+                                });
+
+                                match state.send_message(MessageTarget::Client(user_id), &msg).send_with_result(&mut init_con) {
+                                    Ok(_) => (),
+                                    Err(e) => error!("Message sending error: {}", e),
+                                };
                             },
                             Action::QueueNextAudio(link) => {
                                 debug!("Queued");

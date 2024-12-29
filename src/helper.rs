@@ -74,7 +74,7 @@ pub async fn cleanup_process(process: &mut std::process::Child, name: &str) -> (
     }
     match process.wait() {
         Ok(status) => {
-            if !status.success() {
+            if !status.success() && !status.code().is_none() {
                 error!("{} exited with non-zero status: {:?}", name, status.code());
             }
         }
@@ -163,7 +163,7 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
             Err(_) => Action::None,
             Ok(num) => {
                 let modifier: f32 = num.max(0).min(100) as f32 / 100_f32;
-                Action::ChangeVolume { modifier }
+                Action::ChangeVolume { modifier, user_id }
             }
         };
     }
