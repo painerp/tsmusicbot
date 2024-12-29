@@ -154,10 +154,26 @@ async fn play_file(
     let mut current_volume = volume;
     let mut paused = false;
 
-    let ytdl_url = match Command::new("yt-dlp")
-        .args(&[&link, "--get-url"])
+    // Extract Audio from Youtube using yt-dlp and pipe the output to stdout
+    let mut ytdlp = match Command::new("yt-dlp")
+        .args(&[
+            "--quiet",
+            "--extract-audio",
+            "--audio-format",
+            "opus",
+            "--audio-quality",
+            "48K",
+            "--buffer-size",
+            "16M",
+            "--socket-timeout",
+            "5",
+            "--write-info-json",
+            "--output",
+            "-",
+            &link,
+        ])
         .stdout(Stdio::piped())
-        .output()
+        .spawn()
     {
         Err(why) => {
             if let Err(e) = pkt_send.send(AudioPacket::None).await {
@@ -168,53 +184,45 @@ async fn play_file(
         Ok(process) => process,
     };
 
-    let ytdl_stdout = match String::from_utf8(ytdl_url.stdout) {
-        Ok(urls) => urls,
-        Err(why) => panic!("Empty ytdl command output: {}", why),
+    let mut ffmpeg = match Command::new("ffmpeg")
+        .args(&[
+            "-loglevel",
+            "info",
+            "-i",
+            "pipe:0",
+            "-f",
+            "opus",
+            "-c:a",
+            "pcm_s16be",
+            "-f",
+            "s16be",
+            "pipe:1",
+        ])
+        .stdin(
+            ytdlp
+                .stdout
+                .take()
+                .unwrap_or_else(|| panic!("Failed to get stdout of yt-dlp")),
+        )
+        .stdout(Stdio::piped())
+        .spawn()
+    {
+        Err(e) => panic!("couldn't spawn ffmpeg: {}", e),
+        Ok(process) => process,
     };
 
-    let url = match ytdl_stdout.split('\n').nth(1) {
-        Some(s) => s,
-        None => {
-            error!("Missing audio stream in {}", link);
-            if let Err(e) = pkt_send.send(AudioPacket::None).await {
-                error!("Status packet sending error: {}", e);
-                return;
-            }
-            return;
-        }
-    };
-
+    // Setup Encoder
     let encoder = audiopus::coder::Encoder::new(
         audiopus::SampleRate::Hz48000,
         audiopus::Channels::Stereo,
         audiopus::Application::Audio,
     )
-        .expect("Could not create encoder");
-
-    let ffmpeg = match Command::new("ffmpeg")
-        .args(&[
-            "-loglevel",
-            "quiet",
-            "-i",
-            url,
-            "-af",
-            "aresample=48000",
-            "-f",
-            "s16be",
-            "pipe:1",
-        ])
-        .stdout(Stdio::piped())
-        .spawn()
-    {
-        Err(why) => panic!("couldn't spawn ffmpeg: {}", why),
-        Ok(process) => process,
-    };
+    .expect("Could not create encoder");
 
     let mut pcm_in_be: [i16; FRAME_SIZE * 2] = [0; FRAME_SIZE * 2];
     let mut opus_pkt: [u8; MAX_PACKET_SIZE] = [0; MAX_PACKET_SIZE];
 
-    let mut ffmpeg_stdout = ffmpeg.stdout.unwrap();
+    let ffmpeg_stdout = &mut ffmpeg.stdout.take().unwrap();
 
     loop {
         // start = Instant::now();
@@ -244,26 +252,28 @@ async fn play_file(
             continue;
         }
 
-        match ffmpeg_stdout
-            .read_i16_into::<BigEndian>(&mut pcm_in_be)
-        {
+        match ffmpeg_stdout.read_i16_into::<BigEndian>(&mut pcm_in_be) {
             Err(e) => {
-                debug!("Error ffmpeg_stdout: {}", e);
+                if e.kind() == ErrorKind::UnexpectedEof {
+                    debug!("ffmpeg_stdout: EOF");
+                } else {
+                    error!("Error ffmpeg_stdout: {}", e);
+                }
                 break;
-            },
+            }
             Ok(_) => {}
         };
 
+        // adjust volume and encode in opus
         for i in 0..FRAME_SIZE * 2 {
             pcm_in_be[i] = (pcm_in_be[i] as f32 * current_volume) as i16;
         }
-        let len = encoder.encode(&pcm_in_be, &mut opus_pkt[..]).unwrap_or_else(|e| {
-            error!("Encoding error: {}", e);
-            0
-        });
-        if len < 200 || len > 350 {
-            debug!("encoding is: {}", len);
-        }
+        let len = encoder
+            .encode(&pcm_in_be, &mut opus_pkt[..])
+            .unwrap_or_else(|e| {
+                error!("Encoding error: {}", e);
+                0
+            });
 
         let packet = OutAudio::new(&AudioData::C2S {
             id: 0,
@@ -280,9 +290,7 @@ async fn play_file(
             break;
         }
 
-        let usec_sleep = Duration::from_micros(17000);
-
-        sleep(usec_sleep).await;
+        sleep(Duration::from_micros(17000)).await;
     }
 
     debug!("Cleanup...");
@@ -291,6 +299,9 @@ async fn play_file(
         return;
     }
     cmd_recv.close();
+
+    cleanup_process(&mut ytdlp, "yt-dlp").await;
+    cleanup_process(&mut ffmpeg, "ffmpeg").await;
 }
 
 #[tokio::main]
