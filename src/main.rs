@@ -198,7 +198,7 @@ async fn play_file(
 
         // adjust volume and encode in opus
         for i in 0..FRAME_SIZE * 2 {
-            pcm_in_be[i] = (pcm_in_be[i] as f32 * current_volume) as i16;
+            pcm_in_be[i] = (pcm_in_be[i] as f32 * (current_volume * 0.2)) as i16;
         }
         let len = encoder
             .encode(&pcm_in_be, &mut opus_pkt[..])
