@@ -32,7 +32,7 @@ cargo build --release
 * `!resume`, `!r`, `!continue`, or `!c` - Resume playback of the paused track.
 * `!skip`, `!s`, `!next`, or `!n` - Skip the current track.
 * `!stop` - Stop all playback and clear the queue.
-* `!volume <modifier>` or `!v <modifier>` - Adjust the playback volume. Modifier should be a float in `[0, 1]`
+* `!volume <modifier>` or `!v <modifier>` - Adjust the playback volume. Modifier should be a number between 0 and 100.
 * `!info` or `!i` - Display information about the currently playing track.
 * `!help` or `!h` - Displays the list of available commands.
 * `!quit` or `!q` - Quit the program.

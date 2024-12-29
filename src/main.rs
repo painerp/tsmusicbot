@@ -331,9 +331,9 @@ async fn real_main() -> Result<()> {
                                 if modifier > 0.0 && modifier <= 1.0 {
                                     volume = modifier;
                                     if playing { let _ = cmd_send.send(PlayTaskCmd::ChangeVolume {modifier}).await; };
-                                    msg = format!("Volume set to: {}", modifier);
+                                    msg = format!("Volume set to: {}", (modifier * 100.0).floor());
                                 } else {
-                                    msg = format!("Current Volume: {}", volume);
+                                    msg = format!("Current Volume: {}", (volume * 100.0).floor());
                                 }
                                 send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
@@ -395,7 +395,7 @@ async fn real_main() -> Result<()> {
                             },
                             Action::Help(user_id) => {
                                 debug!("Help");
-                                let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link> or !n <link> - Queue a track as the next track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip, !s, !next, or !n - Skip current track\n!stop - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume (modifier should be a float in [0, 1])\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
+                                let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link> or !n <link> - Queue a track as the next track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip, !s, !next, or !n - Skip current track\n!stop - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume (modifier should be a number from 0 to 100)\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
                                 send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
                             Action::Quit => {

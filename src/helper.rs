@@ -153,6 +153,28 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
         return Action::Quit;
     }
 
+    if split_vec[0] == "!volume" || split_vec[0] == "!v" {
+        return if split_vec.len() < 2 {
+            Action::ChangeVolume {
+                modifier: -1.0,
+                user_id,
+            }
+        } else {
+            info!(
+                "Changing volume to {} (requested by {})",
+                split_vec[1], user_id
+            );
+            let amount = split_vec[1].parse::<u32>();
+            match amount {
+                Err(_) => Action::None,
+                Ok(num) => {
+                    let modifier: f32 = num.max(0).min(100) as f32 / 100_f32;
+                    Action::ChangeVolume { modifier, user_id }
+                }
+            }
+        };
+    }
+
     // return if no second argument
     if split_vec.len() < 2 {
         return Action::None;
@@ -161,21 +183,6 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
     if split_vec[0] == "!yt" || split_vec[0] == "!play" {
         info!("Playing: {} (requested by {})", split_vec[1], user_id);
         return Action::PlayAudio(split_vec[1].to_string(), user_id);
-    }
-
-    if split_vec[0] == "!volume" || split_vec[0] == "!v" {
-        info!(
-            "Changing volume to {} (requested by {})",
-            split_vec[1], user_id
-        );
-        let amount = split_vec[1].parse::<u32>();
-        return match amount {
-            Err(_) => Action::None,
-            Ok(num) => {
-                let modifier: f32 = num.max(0).min(100) as f32 / 100_f32;
-                Action::ChangeVolume { modifier, user_id }
-            }
-        };
     }
 
     Action::None
