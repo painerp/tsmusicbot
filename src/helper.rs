@@ -1,5 +1,8 @@
-use crate::{Action, Config};
+use crate::{Action, Config, InfoJson};
+use anyhow::{Context, Result};
 use log::{error, info};
+use std::fs::File;
+use std::io::BufReader;
 use tsclientlib::{ClientId, Connection, Identity};
 use which::which;
 
@@ -14,7 +17,7 @@ pub fn check_dependencies() -> () {
 }
 
 pub fn read_config(config_file_path: &str) -> Config {
-    let config_file = match std::fs::File::open(config_file_path) {
+    let config_file = match File::open(config_file_path) {
         Ok(id) => id,
         Err(why) => {
             panic!("Unable to open configuration file: {}", why);
@@ -52,6 +55,17 @@ pub fn connect_to_ts(config: Config) -> Connection {
             panic!("Unable to connect: {}", why);
         }
     }
+}
+
+pub fn read_info_json() -> Result<InfoJson> {
+    let file = File::open("-.info.json").with_context(|| "Failed to open the file: -.info.json")?;
+
+    let reader = BufReader::new(file);
+
+    let info_json: InfoJson = serde_json::from_reader(reader)
+        .with_context(|| "Failed to parse the JSON file: -.info.json")?;
+
+    Ok(info_json)
 }
 
 pub async fn cleanup_process(process: &mut std::process::Child, name: &str) -> () {

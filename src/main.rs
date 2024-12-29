@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::helper::{
-    check_dependencies, cleanup_process, connect_to_ts, parse_command, read_config,
+    check_dependencies, cleanup_process, connect_to_ts, parse_command, read_config, read_info_json,
 };
 use tsclientlib::events::Event;
 use tsclientlib::{
@@ -30,6 +30,16 @@ struct Config {
     password: String,
     name: String,
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct InfoJson {
+    id: String,
+    title: String,
+    channel: String,
+    duration: u32,
+    view_count: u64,
+    webpage_url: String,
 }
 
 #[derive(Debug)]
@@ -356,7 +366,15 @@ async fn real_main() -> Result<()> {
                                 debug!("Info");
                                 let mut msg = "\nCurrently Playing:\n".to_owned();
                                 if playing {
-                                    msg += &current_playing_link.clone().unwrap_or_default();
+                                    let link = current_playing_link.clone().unwrap_or_default();
+                                    match read_info_json() {
+                                        Ok(info_json) => {
+                                            msg += &format!("Title: {}\nChannel: {}\nLink: {}", info_json.title, info_json.channel, link);
+                                        }
+                                        Err(_) => {
+                                            msg += &format!("{}", link);
+                                        }
+                                    }
                                 } else {
                                     msg += &"Nothing".to_owned();
                                 }
