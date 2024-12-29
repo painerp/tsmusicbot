@@ -261,6 +261,11 @@ async fn play_file(
     }
     cmd_recv.close();
 
+    let mut state = playback_state.lock().await;
+    state.link = None;
+    state.time_passed = 0.0;
+    drop(state);
+
     cleanup_process(&mut ytdlp, "yt-dlp").await;
     cleanup_process(&mut ffmpeg, "ffmpeg").await;
 }
