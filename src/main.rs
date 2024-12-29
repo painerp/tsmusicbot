@@ -1,21 +1,28 @@
-use anyhow::{bail, Result};
-use byteorder::{BigEndian, ReadBytesExt};
-use futures::prelude::*;
-use log::{error, info, debug};
-use serde::Deserialize;
-use std::collections::VecDeque;
-use std::process::{exit, Command, Stdio};
-use tokio::sync::mpsc;
-use tokio::time::{sleep, timeout, Duration};
-
-use tsclientlib::events::Event;
-use tsclientlib::{ClientId, Connection, DisconnectOptions, Identity, MessageTarget, OutCommandExt, StreamItem};
-use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
-
 extern crate audiopus;
 extern crate byteorder;
 extern crate serde;
 extern crate serde_json;
+mod helper;
+
+use anyhow::{bail, Result};
+use byteorder::{BigEndian, ReadBytesExt};
+use futures::prelude::*;
+use log::{debug, error, info};
+use serde::Deserialize;
+use std::collections::VecDeque;
+use std::io::ErrorKind;
+use std::process::{Command, Stdio};
+use tokio::sync::mpsc;
+use tokio::time::{sleep, timeout, Duration};
+
+use crate::helper::{
+    check_dependencies, cleanup_process, connect_to_ts, parse_command, read_config,
+};
+use tsclientlib::events::Event;
+use tsclientlib::{
+    ClientId, Connection, DisconnectOptions, MessageTarget, OutCommandExt, StreamItem,
+};
+use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
 
 #[derive(Debug, Deserialize)]
 struct Config {
@@ -52,91 +59,6 @@ enum PlayTaskCmd {
 enum AudioPacket {
     Payload(OutPacket),
     None,
-}
-
-fn sanitize(s: &str) -> String {
-    s.chars()
-        .filter(|c| {
-            c.is_alphanumeric()
-                || [
-                ' ', '.', ' ', '=', '\t', ',', '?', '!', ':', '&', '/', '_',
-            ]
-                .contains(c)
-        })
-        .collect()
-}
-
-fn parse_command(msg: &str, user_id: ClientId) -> Action {
-    let stripped = msg.replace("[URL]", "").replace("[/URL]", "");
-    let sanitized = sanitize(&stripped).trim().to_string();
-
-    if &sanitized[..=0] != "!" {
-        return Action::None;
-    }
-
-    let split_vec: Vec<&str> = sanitized.split(' ').collect();
-
-    if split_vec[0] == "!stop" || split_vec[0] == "!s" {
-        return Action::Stop;
-    }
-
-    if split_vec[0] == "!pause" || split_vec[0] == "!p" {
-        return Action::Pause;
-    }
-
-    if split_vec[0] == "!continue" || split_vec[0] == "!c" || split_vec[0] == "!resume" || split_vec[0] == "!r" {
-        return Action::Resume;
-    }
-
-    if split_vec[0] == "!next" || split_vec[0] == "!n" {
-        if split_vec.len() > 1 {
-            debug!("MSG: {}", split_vec[1]);
-            return Action::QueueNextAudio(split_vec[1].to_string());
-        }
-        return Action::Skip;
-    }
-
-    if split_vec[0] == "!skip" || split_vec[0] == "!sk" {
-        return Action::Skip;
-    }
-
-    if split_vec[0] == "!help" || split_vec[0] == "!h" {
-        return Action::Help(user_id);
-    }
-
-    if split_vec[0] == "!info" || split_vec[0] == "!i" {
-        return Action::Info(user_id);
-    }
-
-    if split_vec[0] == "!quit" || split_vec[0] == "!q" {
-        return Action::Quit;
-    }
-
-
-    // return if no second argument
-    if split_vec.len() < 2 {
-        return Action::None;
-    }
-
-    if split_vec[0] == "!yt" || split_vec[0] == "!play" {
-        debug!("MSG: {}", split_vec[1]);
-        return Action::PlayAudio(split_vec[1].to_string());
-    }
-
-    if split_vec[0] == "!volume" || split_vec[0] == "!v" {
-        let amount = split_vec[1].parse::<u32>();
-        return match amount {
-            Err(_) => {
-                Action::None
-            }
-            Ok(num) => {
-                let modifier: f32 = num.max(0).min(100) as f32 / 100_f32;
-                Action::ChangeVolume { modifier }
-            }
-        };
-    }
-
-    Action::None
 }
 
 const DEFAULT_VOLUME: f32 = 0.2;
@@ -187,7 +109,7 @@ async fn play_file(
     let mut ffmpeg = match Command::new("ffmpeg")
         .args(&[
             "-loglevel",
-            "info",
+            "quiet",
             "-i",
             "pipe:0",
             "-f",
@@ -225,10 +147,9 @@ async fn play_file(
     let ffmpeg_stdout = &mut ffmpeg.stdout.take().unwrap();
 
     loop {
-        // start = Instant::now();
-
-        let cmd: Option<PlayTaskCmd> =
-            timeout(Duration::from_micros(1), cmd_recv.recv()).await.unwrap_or_else(|_| None);
+        let cmd: Option<PlayTaskCmd> = timeout(Duration::from_micros(1), cmd_recv.recv())
+            .await
+            .unwrap_or_else(|_| None);
 
         match cmd {
             None => {}
@@ -312,65 +233,12 @@ async fn main() -> Result<()> {
 async fn real_main() -> Result<()> {
     env_logger::init();
 
-    if let Err(why) = Command::new("ffmpeg")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        error!("Unable to execute ffmpeg: {}", why);
-        exit(-1);
-    };
+    check_dependencies();
 
-    if let Err(why) = Command::new("yt-dlp")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        error!("Unable to execute yt-dlp: {}", why);
-        exit(-1);
-    };
+    let config_json: Config = read_config("config.json");
 
-    let config_file_path = "config.json";
-    let config_file = match std::fs::File::open(config_file_path) {
-        Ok(id) => id,
-        Err(why) => {
-            error!("Unable to open configuration file: {}", why);
-            exit(-1);
-        }
-    };
+    let mut init_con: Connection = connect_to_ts(config_json);
 
-    let config_json: Config = match serde_json::from_reader(config_file) {
-        Ok(cfg) => cfg,
-        Err(why) => {
-            error!("Failed to parse config: {}", why);
-            exit(-1);
-        }
-    };
-
-    let con_config = Connection::build(config_json.host)
-        .name(config_json.name)
-        .password(config_json.password)
-        .log_commands(false)
-        .log_packets(false)
-        .log_udp_packets(false);
-
-    let id = match Identity::new_from_str(&config_json.id) {
-        Ok(id) => id,
-        Err(why) => {
-            error!("Invalid teamspeak3 identity string: {}", why);
-            exit(-1);
-        }
-    };
-
-    let con_config = con_config.identity(id);
-
-    let mut init_con = match con_config.connect() {
-        Ok(con) => con,
-        Err(why) => {
-            error!("Unable to connect: {}", why);
-            exit(-1);
-        }
-    };
     let r = init_con
         .events()
         .try_filter(|e| future::ready(matches!(e, StreamItem::BookEvents(_))))
@@ -401,7 +269,9 @@ async fn real_main() -> Result<()> {
                                 target: _,
                                 message,
                             } => {
-                                if let Err(e) = status_send.send(parse_command(&message, user.id)).await {
+                                if let Err(e) =
+                                    status_send.send(parse_command(&message, user.id)).await
+                                {
                                     error!("Status packet sending error: {}", e);
                                 }
                             }
@@ -492,8 +362,7 @@ async fn real_main() -> Result<()> {
                                 }
 
                                 let state = init_con.get_state().unwrap_or_else(|e| {
-                                    error!("Unable to get state: {}", e);
-                                    exit(-1);
+                                    panic!("Unable to get state: {}", e);
                                 });
 
                                 match state.send_message(MessageTarget::Client(user_id), &msg).send_with_result(&mut init_con) {
@@ -503,17 +372,15 @@ async fn real_main() -> Result<()> {
                             },
                             Action::Help(user_id) => {
                                 debug!("Help");
-                                let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link>, !n <link>, !next, or !n - Queue a track as next or skip current track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip or !sk - Skip current track\n!stop or !s - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
+                                let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link>, !n <link>, !next, or !n - Queue a track as next or skip current track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip or !s - Skip current track\n!stop - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
 
                                 let state = init_con.get_state().unwrap_or_else(|e| {
-                                    error!("Unable to get state: {}", e);
-                                    exit(-1);
+                                    panic!("Unable to get state: {}", e);
                                 });
                                 if let Err(e) = state.send_message(MessageTarget::Client(user_id), &msg).send_with_result(&mut init_con)
                                 {
                                     error!("Message sending error: {}", e);
                                 };
-
                             },
                             Action::Quit => {
                                 debug!("Quit");
