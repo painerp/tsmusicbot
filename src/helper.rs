@@ -3,7 +3,7 @@ use anyhow::{Context, Result};
 use log::{error, info};
 use std::fs::File;
 use std::io::BufReader;
-use tsclientlib::{ClientId, Connection, Identity};
+use tsclientlib::{ClientId, Connection, Identity, MessageTarget, OutCommandExt};
 use which::which;
 
 pub fn check_dependencies() -> () {
@@ -79,6 +79,16 @@ pub async fn cleanup_process(process: &mut std::process::Child, name: &str) -> (
             }
         }
         Err(e) => error!("Failed to wait on {}: {}", name, e),
+    }
+}
+
+pub fn send_ts_message(con: &mut Connection, target: MessageTarget, msg: &str) -> () {
+    let state = con.get_state().unwrap_or_else(|e| {
+        panic!("Unable to get state: {}", e);
+    });
+
+    if let Err(e) = state.send_message(target, &msg).send_with_result(con) {
+        error!("Message sending error: {}", e);
     }
 }
 

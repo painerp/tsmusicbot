@@ -17,6 +17,7 @@ use tokio::time::{sleep, timeout, Duration};
 
 use crate::helper::{
     check_dependencies, cleanup_process, connect_to_ts, parse_command, read_config, read_info_json,
+    send_ts_message,
 };
 use tsclientlib::events::Event;
 use tsclientlib::{
@@ -405,15 +406,8 @@ async fn real_main() -> Result<()> {
                             },
                             Action::Help(user_id) => {
                                 debug!("Help");
-                                let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link>, !n <link>, !next, or !n - Queue a track as next or skip current track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip or !s - Skip current track\n!stop - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
-
-                                let state = init_con.get_state().unwrap_or_else(|e| {
-                                    panic!("Unable to get state: {}", e);
-                                });
-                                if let Err(e) = state.send_message(MessageTarget::Client(user_id), &msg).send_with_result(&mut init_con)
-                                {
-                                    error!("Message sending error: {}", e);
-                                };
+                                let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link> or !n <link> - Queue a track as the next track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip, !s, !next, or !n - Skip current track\n!stop - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume (modifier should be a float in [0, 1])\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
                             Action::Quit => {
                                 debug!("Quit");
