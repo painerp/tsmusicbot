@@ -12,6 +12,7 @@ use futures::prelude::*;
 use log::{debug, error, info};
 use serde::Deserialize;
 use std::collections::VecDeque;
+use std::env;
 use std::io::ErrorKind;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -22,7 +23,7 @@ use tokio::time::{sleep, timeout, Duration};
 
 use crate::helper::{
     check_dependencies, cleanup_process, connect_to_ts, get_status, parse_command, read_config,
-    read_info_json, send_ts_message,
+    read_info_json, resolve_host, send_ts_message,
 };
 use tsclientlib::events::Event;
 use tsclientlib::{ClientId, Connection, DisconnectOptions, MessageTarget, StreamItem};
@@ -281,7 +282,15 @@ async fn real_main() -> Result<()> {
 
     check_dependencies();
 
-    let config_json: Config = read_config("config.json");
+    let mut config_json: Config = read_config("config.json");
+
+    let pre_resolve = env::var("PRE_RESOLVE_HOST")
+        .map(|v| v.to_lowercase() == "true")
+        .unwrap_or(false);
+
+    if pre_resolve {
+        config_json.host = resolve_host(&config_json.host).await?;
+    }
 
     let mut init_con: Connection = connect_to_ts(config_json);
 

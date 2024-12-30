@@ -7,6 +7,7 @@ use serde_json::json;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
+use tokio::net::lookup_host;
 use tokio::sync::Mutex;
 use tsclientlib::{ClientId, Connection, Identity, MessageTarget, OutCommandExt};
 use which::which;
@@ -201,4 +202,23 @@ pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<
         "paused": playback_state.paused,
         "link": playback_state.link.clone().unwrap_or_default(),
     }))
+}
+
+pub async fn resolve_host(host: &str) -> Result<String> {
+    match lookup_host((host, 0)).await {
+        Ok(addresses) => {
+            if let Some(addr) = addresses.filter(|addr| addr.ip().is_ipv4()).next() {
+                info!("Resolved host: {} to IP: {}", host, addr.ip());
+                return Ok(addr.ip().to_string());
+            }
+        }
+        Err(e) => {
+            error!(
+                "DNS resolution error for host: {}. Reason: {}. Using hostname as fallback.",
+                host, e
+            );
+        }
+    }
+
+    Ok(host.to_string())
 }
