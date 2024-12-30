@@ -1,6 +1,5 @@
 FROM alpine:latest as builder
 
-# For some reason the standard rust builder image does not work at all!
 RUN apk add --update --no-cache cargo rust rust-gdb rust-src rust-lldb
 
 RUN apk add --update --no-cache musl-dev pkgconfig openssl-dev opus-dev
@@ -26,12 +25,10 @@ ARG uid=2000
 RUN adduser --uid=${uid} --disabled-password --gecos="" ${user}
 
 USER ${uid}:${uid}
-WORKDIR $HOME
+WORKDIR /app
 
-COPY --from=builder /root/.cargo/bin/tsmusicbot /usr/local/bin/tsmusicbot
-COPY config.json.default /opt/tsmusicbot/config.json
+COPY --from=builder /root/.cargo/bin/tsmusicbot /app/tsmusicbot
+CMD ["chown -R ${uid}:${uid} /app"]
 
-VOLUME /opt/tsmusicbot
-
-ENV RUST_LOG=TRACE
-ENTRYPOINT ["tsmusicbot"]
+ENV RUST_LOG="error,tsmusicbot=info"
+ENTRYPOINT ["/app/tsmusicbot"]
