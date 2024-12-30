@@ -16,6 +16,7 @@ use std::io::ErrorKind;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
+use tokio::signal::unix::SignalKind;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
 
@@ -327,6 +328,7 @@ async fn real_main() -> Result<()> {
         axum::serve(listener, app)
             .await
             .unwrap_or_else(|e| panic!("Failed to start http server: {}", e));
+        info!("HTTP server started on 0.0.0.0:3000");
     });
 
     loop {
@@ -354,6 +356,10 @@ async fn real_main() -> Result<()> {
             };
             Ok(())
         });
+
+        info!("Connected to TeamSpeak Server");
+
+        let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate())?;
 
         tokio::select! {
             val = status_recv.recv() => {
@@ -506,7 +512,14 @@ async fn real_main() -> Result<()> {
                 }
             }
 
-            _ = tokio::signal::ctrl_c() => { break; }
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received Ctrl+C signal, shutting down...");
+                break;
+            },
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM signal, shutting down...");
+                break;
+            },
             r = events => {
                 r?;
                 init_con.disconnect(DisconnectOptions::new())?;
