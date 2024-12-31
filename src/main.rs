@@ -303,6 +303,8 @@ async fn real_main() -> Result<()> {
         r?;
     }
 
+    info!("Connected to TeamSpeak Server");
+
     let (pkt_send, mut pkt_recv) = mpsc::channel(64);
     let (status_send, mut status_recv) = mpsc::channel(64);
     let mut playing: bool = false;
@@ -365,8 +367,6 @@ async fn real_main() -> Result<()> {
             };
             Ok(())
         });
-
-        info!("Connected to TeamSpeak Server");
 
         let mut sigterm = tokio::signal::unix::signal(SignalKind::terminate())?;
 
