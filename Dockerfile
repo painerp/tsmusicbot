@@ -31,4 +31,6 @@ COPY --from=builder /root/.cargo/bin/tsmusicbot /app/tsmusicbot
 CMD ["chown -R ${uid}:${uid} /app"]
 
 ENV RUST_LOG="error,tsmusicbot=info"
+
+EXPOSE 3000
 ENTRYPOINT ["/app/tsmusicbot"]
