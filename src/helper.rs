@@ -197,9 +197,18 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<serde_json::Value> {
     let playback_state = state.lock().await;
 
+    let duration = match read_info_json() {
+        Ok(info_json) => Some(info_json.duration),
+        Err(err) => {
+            error!("Failed to read info JSON: {}", err);
+            None
+        }
+    };
+
     Json(json!({
         "time": playback_state.time_passed,
         "paused": playback_state.paused,
+        "duration": duration,
         "link": playback_state.link.clone().unwrap_or_default(),
     }))
 }
