@@ -13,11 +13,11 @@ use log::{debug, error, info, warn};
 use serde::Deserialize;
 use socketioxide::{extract::SocketRef, SocketIo};
 use std::collections::VecDeque;
-use std::env;
 use std::io::ErrorKind;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Instant;
+use std::{env, fs};
 use tokio::signal::unix::SignalKind;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
@@ -108,23 +108,30 @@ async fn play_file(
     drop(state);
 
     // Extract Audio from Youtube using yt-dlp and pipe the output to stdout
+    let mut ytdlp_args = vec![
+        "--quiet",
+        "--extract-audio",
+        "--audio-format",
+        "opus",
+        "--audio-quality",
+        "48K",
+        "--buffer-size",
+        "16M",
+        "--socket-timeout",
+        "5",
+        "--write-info-json",
+        "--output",
+        "-",
+    ];
+
+    if fs::metadata("cookies.txt").is_ok() {
+        ytdlp_args.push("--cookies");
+        ytdlp_args.push("cookies.txt");
+    }
+    ytdlp_args.push(&link);
+
     let mut ytdlp = match Command::new("yt-dlp")
-        .args(&[
-            "--quiet",
-            "--extract-audio",
-            "--audio-format",
-            "opus",
-            "--audio-quality",
-            "48K",
-            "--buffer-size",
-            "16M",
-            "--socket-timeout",
-            "5",
-            "--write-info-json",
-            "--output",
-            "-",
-            &link,
-        ])
+        .args(&ytdlp_args)
         .stdout(Stdio::piped())
         .spawn()
     {
