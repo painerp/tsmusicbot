@@ -176,9 +176,9 @@ async fn play_file(
 
     let ffmpeg_stdout = &mut ffmpeg.stdout.take().unwrap();
 
+    let mut first_frame = true;
+    let mut last_state_update = Instant::now();
     loop {
-        let start = Instant::now();
-
         let cmd: Option<PlayTaskCmd> = timeout(Duration::from_micros(1), cmd_recv.recv())
             .await
             .unwrap_or_else(|_| None);
@@ -249,12 +249,29 @@ async fn play_file(
             break;
         }
 
-        sleep(Duration::from_micros(17000)).await;
-        time_passed += start.elapsed().as_millis() as f64 / 1000.0;
-        let mut state = playback_state.lock().await;
-        state.time_passed = time_passed;
-        drop(state);
+        sleep(Duration::from_micros(17200)).await;
+
+        if first_frame {
+            first_frame = false;
+        } else {
+            time_passed += Duration::from_micros(20000).as_secs_f64();
+        }
+
+        if last_state_update.elapsed().as_millis() > 50 {
+            let playback_state_clone = Arc::clone(&playback_state);
+            tokio::spawn(async move {
+                let mut state = playback_state_clone.lock().await;
+                state.time_passed = time_passed;
+                drop(state);
+            });
+            last_state_update = Instant::now();
+        }
     }
+
+    let mut state = playback_state.lock().await;
+    state.link = None;
+    state.time_passed = 0.0;
+    drop(state);
 
     debug!("Cleanup...");
     if let Err(e) = pkt_send.send(AudioPacket::None).await {
@@ -262,11 +279,6 @@ async fn play_file(
         return;
     }
     cmd_recv.close();
-
-    let mut state = playback_state.lock().await;
-    state.link = None;
-    state.time_passed = 0.0;
-    drop(state);
 
     cleanup_process(&mut ytdlp, "yt-dlp").await;
     cleanup_process(&mut ffmpeg, "ffmpeg").await;
