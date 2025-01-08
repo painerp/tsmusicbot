@@ -9,8 +9,9 @@ use axum::extract::State;
 use axum::{routing::get, Router};
 use byteorder::{BigEndian, ReadBytesExt};
 use futures::prelude::*;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use serde::Deserialize;
+use socketioxide::{extract::SocketRef, SocketIo};
 use std::collections::VecDeque;
 use std::env;
 use std::io::ErrorKind;
@@ -333,17 +334,36 @@ async fn real_main() -> Result<()> {
         link: None,
     }));
 
-    let playback_state_clone = Arc::clone(&playback_state);
+    let playback_state_clone1 = Arc::clone(&playback_state);
+    let playback_state_clone2 = Arc::clone(&playback_state);
     tokio::spawn(async move {
+        let (layer, io) = SocketIo::new_layer();
+        io.ns("/", |s: SocketRef| {
+            info!("Client connected to Socket");
+            s.on_disconnect(|| {
+                info!("Client disconnected");
+            });
+
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                loop {
+                    interval.tick().await;
+                    let status = get_status(State(Arc::clone(&playback_state_clone2))).await;
+                    s.emit("status", &status.to_string()).ok();
+                }
+            });
+        });
+
         let app = Router::new()
             .route("/", get(|| async { "TSMusicbot is running!" }))
             .route(
                 "/status",
                 get({
-                    let playback_state_clone = Arc::clone(&playback_state_clone);
+                    let playback_state_clone = Arc::clone(&playback_state_clone1);
                     move || get_status(State(playback_state_clone))
                 }),
-            );
+            )
+            .layer(layer);
 
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
             .await
