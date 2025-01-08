@@ -2,6 +2,7 @@ use crate::{Action, Config, InfoJson, PlaybackState};
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::Json;
+use chrono::Utc;
 use log::{error, info};
 use serde_json::json;
 use std::fs::File;
@@ -210,6 +211,7 @@ pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<
 
     Json(json!({
         "time": playback_state.time_passed,
+        "timestamp": Utc::now().to_rfc3339(),
         "paused": playback_state.paused,
         "duration": duration,
         "link": playback_state.link.clone().unwrap_or_default(),
