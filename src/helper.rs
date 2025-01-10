@@ -203,7 +203,8 @@ pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<
     let playback_state = state.lock().await;
     let mut duration: u32 = 0;
 
-    if fs::metadata("-.info.json").is_ok() {
+    if fs::metadata("-.info.json").is_ok() && playback_state.link.clone().unwrap_or_default() != ""
+    {
         duration = match read_info_json() {
             Ok(info_json) => info_json.duration,
             Err(err) => {
