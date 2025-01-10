@@ -186,7 +186,6 @@ async fn play_file(
 
     let ideal_frame_duration = Duration::from_micros(18830);
     let mut first_frame = true;
-    let mut last_state_update = Instant::now();
     loop {
         let frame_start_time = Instant::now();
 
