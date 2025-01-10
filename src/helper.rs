@@ -5,6 +5,7 @@ use axum::Json;
 use chrono::Utc;
 use log::{error, info};
 use serde_json::json;
+use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -200,14 +201,17 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 
 pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<serde_json::Value> {
     let playback_state = state.lock().await;
+    let mut duration: u32 = 0;
 
-    let duration = match read_info_json() {
-        Ok(info_json) => Some(info_json.duration),
-        Err(err) => {
-            error!("Failed to read info JSON: {}", err);
-            None
-        }
-    };
+    if fs::metadata("-.info.json").is_ok() {
+        duration = match read_info_json() {
+            Ok(info_json) => info_json.duration,
+            Err(err) => {
+                error!("Failed to read info JSON: {}", err);
+                0
+            }
+        };
+    }
 
     Json(json!({
         "time": playback_state.time_passed,
