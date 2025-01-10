@@ -184,9 +184,12 @@ async fn play_file(
 
     let ffmpeg_stdout = &mut ffmpeg.stdout.take().unwrap();
 
+    let ideal_frame_duration = Duration::from_micros(18830);
     let mut first_frame = true;
     let mut last_state_update = Instant::now();
     loop {
+        let frame_start_time = Instant::now();
+
         let cmd: Option<PlayTaskCmd> = timeout(Duration::from_micros(1), cmd_recv.recv())
             .await
             .unwrap_or_else(|_| None);
@@ -257,23 +260,28 @@ async fn play_file(
             break;
         }
 
-        sleep(Duration::from_micros(17200)).await;
+        let elapsed = frame_start_time.elapsed();
+        if let Some(remaining) = ideal_frame_duration.checked_sub(elapsed) {
+            sleep(remaining).await;
+        } else {
+            warn!(
+                "Audio processing lagged by {:?}",
+                elapsed - ideal_frame_duration
+            );
+        }
 
         if first_frame {
             first_frame = false;
         } else {
-            time_passed += Duration::from_micros(20000).as_secs_f64();
+            time_passed += Duration::from_micros(20031).as_secs_f64();
         }
 
-        if last_state_update.elapsed().as_millis() > 50 {
-            let playback_state_clone = Arc::clone(&playback_state);
-            tokio::spawn(async move {
-                let mut state = playback_state_clone.lock().await;
-                state.time_passed = time_passed;
-                drop(state);
-            });
-            last_state_update = Instant::now();
-        }
+        let playback_state_clone = Arc::clone(&playback_state);
+        tokio::spawn(async move {
+            let mut state = playback_state_clone.lock().await;
+            state.time_passed = time_passed;
+            drop(state);
+        });
     }
 
     let mut state = playback_state.lock().await;
