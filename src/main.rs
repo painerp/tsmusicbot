@@ -40,12 +40,11 @@ struct Config {
 
 #[derive(Debug, Deserialize)]
 struct InfoJson {
-    id: String,
     title: String,
+    // direct links have no channel, livestreams no duration
+    #[serde(default)]
     channel: String,
-    duration: u32,
-    view_count: u64,
-    webpage_url: String,
+    duration: Option<f64>,
 }
 
 #[derive(Debug)]

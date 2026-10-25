@@ -206,7 +206,7 @@ pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<
     if fs::metadata("-.info.json").is_ok() && playback_state.link.clone().unwrap_or_default() != ""
     {
         duration = match read_info_json() {
-            Ok(info_json) => info_json.duration,
+            Ok(info_json) => info_json.duration.unwrap_or(0.0) as u32,
             Err(err) => {
                 error!("Failed to read info JSON: {}", err);
                 0
