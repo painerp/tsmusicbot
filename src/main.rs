@@ -388,10 +388,10 @@ async fn real_main() -> Result<()> {
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
             .await
             .unwrap_or_else(|e| panic!("Failed to bind to 0.0.0.0:3000: {}", e));
+        info!("HTTP server started on 0.0.0.0:3000");
         axum::serve(listener, app)
             .await
             .unwrap_or_else(|e| panic!("Failed to start http server: {}", e));
-        info!("HTTP server started on 0.0.0.0:3000");
     });
 
     loop {
