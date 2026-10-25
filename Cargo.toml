@@ -6,7 +6,7 @@ edition = "2018"
 
 [dependencies]
 byteorder = "1.5.0"
-audiopus = "0.2.0"
+audiopus = "0.3.0-rc.0"
 serde = "1.0.217"
 serde_json = "1.0.135"
 tsclientlib = { git = "https://github.com/ReSpeak/tsclientlib" }
@@ -16,10 +16,10 @@ futures = "0.3.31"
 tokio = { version = "1.42.0", features = ["time", "signal", "process"] }
 log = "0.4.22"
 env_logger = "0.11.6"
-which = "7.0.1"
-axum = "0.7.9"
+which = "8.0.6"
+axum = "0.8.9"
 chrono = "0.4.39"
-socketioxide = "0.15.1"
+socketioxide = "0.18.7"
 
 [dependencies.slog]
 version = "2.7.0"

@@ -352,9 +352,9 @@ async fn real_main() -> Result<()> {
     let playback_state_clone2 = Arc::clone(&playback_state);
     tokio::spawn(async move {
         let (layer, io) = SocketIo::new_layer();
-        io.ns("/", |s: SocketRef| {
+        io.ns("/", |s: SocketRef| async move {
             info!("Client connected to Socket");
-            s.on_disconnect(|| {
+            s.on_disconnect(|| async {
                 info!("Client disconnected");
             });
 
@@ -580,7 +580,7 @@ async fn real_main() -> Result<()> {
                 init_con.disconnect(DisconnectOptions::new())?;
                 bail!("Disconnected");
             }
-        };
+        }
     }
 
     // Disconnect
