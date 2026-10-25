@@ -31,7 +31,7 @@ WORKDIR /app
 # venv owned by the bot user so entrypoint.sh can keep yt-dlp updated at runtime
 ENV PATH="/app/venv/bin:$PATH"
 RUN python3 -m venv /app/venv \
-    && pip install --no-cache-dir --disable-pip-version-check -U --pre "yt-dlp[default]" bgutil-ytdlp-pot-provider
+    && pip install --no-cache-dir --disable-pip-version-check -U --pre "yt-dlp[default]"
 
 COPY --from=builder /root/.cargo/bin/tsmusicbot /app/tsmusicbot
 COPY --chmod=755 entrypoint.sh /entrypoint.sh
