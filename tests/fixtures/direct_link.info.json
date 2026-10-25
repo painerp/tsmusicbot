@@ -1,0 +1,6 @@
+{
+  "id": "song",
+  "title": "song",
+  "extractor": "generic",
+  "webpage_url": "http://127.0.0.1:8000/song.mp3"
+}

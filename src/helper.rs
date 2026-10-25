@@ -1,14 +1,16 @@
 use crate::{Action, Config, InfoJson, PlaybackState};
 use anyhow::{Context, Result};
 use axum::extract::State;
-use axum::Json;
+use axum::{routing::get, Json, Router};
 use chrono::Utc;
 use log::{error, info};
 use serde_json::json;
+use socketioxide::{extract::SocketRef, SocketIo};
 use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::net::lookup_host;
 use tokio::sync::Mutex;
 use tsclientlib::{ClientId, Connection, Identity, MessageTarget, OutCommandExt};
@@ -74,6 +76,33 @@ pub fn read_info_json() -> Result<InfoJson> {
         .with_context(|| "Failed to parse the JSON file: -.info.json")?;
 
     Ok(info_json)
+}
+
+pub fn ytdlp_args(link: &str, cookies: bool) -> Vec<&str> {
+    let mut args = vec![
+        "--quiet",
+        "--extract-audio",
+        "--audio-format",
+        "opus",
+        "--audio-quality",
+        "48K",
+        "--buffer-size",
+        "16M",
+        "--socket-timeout",
+        "5",
+        "--write-info-json",
+        "--no-playlist",
+        "--output",
+        "-",
+    ];
+
+    if cookies {
+        args.push("--cookies");
+        args.push("cookies.txt");
+    }
+    args.push("--");
+    args.push(link);
+    args
 }
 
 pub async fn cleanup_process(process: &mut tokio::process::Child, name: &str) -> () {
@@ -224,6 +253,34 @@ pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<
     }))
 }
 
+pub fn app(playback_state: Arc<Mutex<PlaybackState>>) -> Router {
+    let (layer, io) = SocketIo::new_layer();
+    let socket_state = Arc::clone(&playback_state);
+    io.ns("/", |s: SocketRef| async move {
+        info!("Client connected to Socket");
+        s.on_disconnect(|| async {
+            info!("Client disconnected");
+        });
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            loop {
+                interval.tick().await;
+                if !s.connected() {
+                    break;
+                }
+                let status = get_status(State(Arc::clone(&socket_state))).await;
+                s.emit("status", &status.to_string()).ok();
+            }
+        });
+    });
+
+    Router::new()
+        .route("/", get(|| async { "TSMusicbot is running!" }))
+        .route("/status", get(move || get_status(State(playback_state))))
+        .layer(layer)
+}
+
 pub async fn resolve_host(host: &str) -> Result<String> {
     match lookup_host((host, 0)).await {
         Ok(addresses) => {
@@ -246,13 +303,240 @@ pub async fn resolve_host(host: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+    use std::future::IntoFuture;
+    use std::net::SocketAddr;
+    use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+
+    const U: ClientId = ClientId(1);
+    const VIDEO: &str = include_str!("../tests/fixtures/youtube_video.info.json");
+    const LIVESTREAM: &str = include_str!("../tests/fixtures/youtube_livestream.info.json");
+    const DIRECT_LINK: &str = include_str!("../tests/fixtures/direct_link.info.json");
 
     #[test]
     fn parse_command_ignores_non_commands_without_panicking() {
         // "" is what a poke without text sends; "^^" sanitizes to ""; "über" starts with a multi-byte char
-        for msg in ["", "^^", "über", "hello"] {
-            assert!(matches!(parse_command(msg, ClientId(1)), Action::None), "{:?}", msg);
+        for msg in ["", "^^", ";)", "über", "😀", "…", "hello", "!", "!unknown"] {
+            assert_eq!(parse_command(msg, U), Action::None, "{:?}", msg);
         }
-        assert!(matches!(parse_command("!stop", ClientId(1)), Action::Stop));
+    }
+
+    #[test]
+    fn parse_command_maps_every_alias() {
+        let link = || "https://youtu.be/dQw4w9WgXcQ".to_string();
+        let cases = vec![
+            ("!play https://youtu.be/dQw4w9WgXcQ", Action::PlayAudio(link(), U)),
+            ("!yt https://youtu.be/dQw4w9WgXcQ", Action::PlayAudio(link(), U)),
+            ("!next https://youtu.be/dQw4w9WgXcQ", Action::QueueNextAudio(link(), U)),
+            ("!n https://youtu.be/dQw4w9WgXcQ", Action::QueueNextAudio(link(), U)),
+            ("!next", Action::Skip),
+            ("!n", Action::Skip),
+            ("!skip", Action::Skip),
+            ("!s", Action::Skip),
+            ("!pause", Action::Pause),
+            ("!p", Action::Pause),
+            ("!resume", Action::Resume),
+            ("!r", Action::Resume),
+            ("!continue", Action::Resume),
+            ("!c", Action::Resume),
+            ("!stop", Action::Stop),
+            ("!info", Action::Info(U)),
+            ("!i", Action::Info(U)),
+            ("!help", Action::Help(U)),
+            ("!h", Action::Help(U)),
+            ("!quit", Action::Quit),
+            ("!q", Action::Quit),
+            ("!play", Action::None),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(parse_command(msg, U), expected, "{:?}", msg);
+        }
+    }
+
+    #[test]
+    fn parse_command_keeps_links_intact() {
+        for link in [
+            "https://www.youtube.com/watch?v=a-b_c1&list=PL-x_y&index=2&t=30s",
+            "https://youtu.be/dQw4w9WgXcQ?si=Ab-c_d",
+            "https://www.youtube.com/shorts/dQw4w9WgXcQ",
+            "https://music.youtube.com/watch?v=dQw4w9WgXcQ&feature=share",
+            "https://soundcloud.com/artist-name/track_name",
+        ] {
+            let expected = Action::PlayAudio(link.to_string(), U);
+            // TeamSpeak wraps pasted links in [URL] tags; anything but one space used to give an empty link
+            for msg in [
+                format!("!play {}", link),
+                format!("!play [URL]{}[/URL]", link),
+                format!("!play  {}", link),
+                format!("!play\t{}", link),
+                format!("  !play {}  ", link),
+            ] {
+                assert_eq!(parse_command(&msg, U), expected, "{:?}", msg);
+            }
+        }
+    }
+
+    #[test]
+    fn parse_command_volume() {
+        let volume = |modifier| Action::ChangeVolume { modifier, user_id: U };
+        assert_eq!(parse_command("!v", U), volume(-1.0));
+        assert_eq!(parse_command("!volume 50", U), volume(0.5));
+        assert_eq!(parse_command("!v 100", U), volume(1.0));
+        assert_eq!(parse_command("!v 250", U), volume(1.0));
+        assert_eq!(parse_command("!v abc", U), Action::None);
+        assert_eq!(parse_command("!v -5", U), Action::None);
+    }
+
+    #[test]
+    fn info_json_parses_real_yt_dlp_output() {
+        let video: InfoJson = serde_json::from_str(VIDEO).unwrap();
+        assert_eq!((video.channel.as_str(), video.duration), ("media.ccc.de", Some(2326.0)));
+        let live: InfoJson = serde_json::from_str(LIVESTREAM).unwrap();
+        assert_eq!((live.channel.as_str(), live.duration), ("Lofi Girl", None));
+        let direct: InfoJson = serde_json::from_str(DIRECT_LINK).unwrap();
+        assert_eq!((direct.title.as_str(), direct.channel.as_str(), direct.duration), ("song", "", None));
+    }
+
+    #[test]
+    fn ytdlp_args_contract() {
+        let args = ytdlp_args("-x", false);
+        // play_file reads audio from stdout and get_status the duration from -.info.json
+        assert!(args.windows(2).any(|w| w == ["--output", "-"]));
+        assert!(args.contains(&"--write-info-json"));
+        // without it a Mix link (watch?v=..&list=..) streams the whole playlist as one song
+        assert!(args.contains(&"--no-playlist"));
+        // "--" keeps a link like "-x" from being parsed as an option
+        assert_eq!(args[args.len() - 2..], ["--", "-x"]);
+        assert!(!args.contains(&"--cookies"));
+        assert!(ytdlp_args("x", true).windows(2).any(|w| w == ["--cookies", "cookies.txt"]));
+    }
+
+    fn new_state(link: Option<&str>) -> Arc<Mutex<PlaybackState>> {
+        Arc::new(Mutex::new(PlaybackState {
+            time_passed: 0.0,
+            paused: false,
+            link: link.map(String::from),
+        }))
+    }
+
+    async fn serve(state: Arc<Mutex<PlaybackState>>) -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(axum::serve(listener, app(state)).into_future());
+        addr
+    }
+
+    // minimal HTTP/1.1 client, enough for these tests without another dependency
+    async fn http(addr: SocketAddr, method: &str, path: &str, body: &str) -> (u16, String) {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let request = format!(
+            "{} {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{}",
+            method,
+            path,
+            body.len(),
+            body
+        );
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        let (head, body) = response.split_once("\r\n\r\n").unwrap();
+        assert!(!head.to_lowercase().contains("chunked"), "{}", head);
+        (head[9..12].parse().unwrap(), body.to_string())
+    }
+
+    // engine.io v4 long-polling: handshake, then join the "/" namespace
+    async fn socket_connect(addr: SocketAddr) -> String {
+        let (_, handshake) = http(addr, "GET", "/socket.io/?EIO=4&transport=polling", "").await;
+        let handshake: Value = serde_json::from_str(handshake.strip_prefix('0').unwrap()).unwrap();
+        let path = format!("/socket.io/?EIO=4&transport=polling&sid={}", handshake["sid"].as_str().unwrap());
+        assert_eq!(http(addr, "POST", &path, "40").await, (200, "ok".to_string()));
+        path
+    }
+
+    #[tokio::test]
+    async fn http_routes() {
+        let addr = serve(new_state(None)).await;
+        assert_eq!(http(addr, "GET", "/", "").await, (200, "TSMusicbot is running!".to_string()));
+
+        let (code, body) = http(addr, "GET", "/status", "").await;
+        assert_eq!(code, 200);
+        // the now-playing page reads these fields
+        let status: Value = serde_json::from_str(&body).unwrap();
+        assert!(status["time"].is_f64(), "{}", status);
+        assert!(status["paused"].is_boolean(), "{}", status);
+        assert!(status["duration"].is_u64(), "{}", status);
+        assert_eq!(status["link"], "");
+        assert!(chrono::DateTime::parse_from_rfc3339(status["timestamp"].as_str().unwrap()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn status_duration_from_info_json() {
+        // yt-dlp writes -.info.json to the working directory; the only test that uses it
+        let dir = std::env::temp_dir().join(format!("tsmusicbot-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_current_dir(&dir).unwrap();
+        let link = Some("https://youtu.be/x");
+        let duration = |link| async move { get_status(State(new_state(link))).await.0["duration"].clone() };
+
+        // song still starting, no file yet
+        assert_eq!(duration(link).await, 0);
+        fs::write("-.info.json", VIDEO).unwrap();
+        assert_eq!(duration(link).await, 2326);
+        // file left over from the previous song while idle
+        assert_eq!(duration(None).await, 0);
+        fs::write("-.info.json", LIVESTREAM).unwrap();
+        assert_eq!(duration(link).await, 0);
+        fs::write("-.info.json", DIRECT_LINK).unwrap();
+        assert_eq!(duration(link).await, 0);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn socket_emits_status_every_second() {
+        let addr = serve(new_state(Some("https://youtu.be/x"))).await;
+        let path = socket_connect(addr).await;
+        let start = Instant::now();
+        let mut statuses = 0;
+        while statuses < 2 {
+            assert!(start.elapsed() < Duration::from_secs(5), "only {} status events", statuses);
+            let (_, body) = http(addr, "GET", &path, "").await;
+            for packet in body.split('\x1e') {
+                if let Some(event) = packet.strip_prefix("42") {
+                    // the payload is a JSON string, not an object
+                    let (name, payload): (String, String) = serde_json::from_str(event).unwrap();
+                    assert_eq!(name, "status");
+                    let status: Value = serde_json::from_str(&payload).unwrap();
+                    assert_eq!(status["link"], "https://youtu.be/x");
+                    statuses += 1;
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn socket_status_task_ends_on_disconnect() {
+        let addr = serve(new_state(None)).await;
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let baseline = metrics.num_alive_tasks();
+        for _ in 0..3 {
+            let path = socket_connect(addr).await;
+            http(addr, "GET", &path, "").await;
+            // engine.io close packet, like a closed browser tab
+            http(addr, "POST", &path, "1").await;
+        }
+        // each status loop notices the disconnect on its next 1s tick
+        let start = Instant::now();
+        while metrics.num_alive_tasks() > baseline {
+            assert!(
+                start.elapsed() < Duration::from_secs(3),
+                "{} tasks alive, baseline {}",
+                metrics.num_alive_tasks(),
+                baseline
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
     }
 }

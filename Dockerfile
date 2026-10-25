@@ -1,4 +1,4 @@
-FROM alpine:latest as builder
+FROM alpine:latest as toolchain
 
 RUN apk add --update --no-cache cargo rust rust-gdb rust-src rust-lldb
 
@@ -7,9 +7,18 @@ RUN apk add --update --no-cache musl-dev pkgconfig openssl-dev opus-dev
 WORKDIR /usr/src/tsmusicbot
 COPY . .
 
+# only built with --target test (CI runs it before building the image)
+FROM toolchain as test
+
 RUN --mount=type=cache,target=/root/.cargo/registry \
     --mount=type=cache,target=/usr/src/tsmusicbot/target \
-    cargo install --path .
+    cargo test --locked
+
+FROM toolchain as builder
+
+RUN --mount=type=cache,target=/root/.cargo/registry \
+    --mount=type=cache,target=/usr/src/tsmusicbot/target \
+    cargo install --locked --path .
 
 FROM alpine:latest as final
 

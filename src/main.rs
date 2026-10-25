@@ -4,12 +4,9 @@ extern crate serde_json;
 mod helper;
 
 use anyhow::{bail, Result};
-use axum::extract::State;
-use axum::{routing::get, Router};
 use futures::prelude::*;
 use log::{debug, error, info, warn};
 use serde::Deserialize;
-use socketioxide::{extract::SocketRef, SocketIo};
 use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::io::ErrorKind;
@@ -24,8 +21,8 @@ use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
 
 use crate::helper::{
-    check_dependencies, cleanup_process, connect_to_ts, get_status, parse_command, read_config,
-    read_info_json, resolve_host, send_ts_message,
+    app, check_dependencies, cleanup_process, connect_to_ts, parse_command, read_config,
+    read_info_json, resolve_host, send_ts_message, ytdlp_args,
 };
 use tsclientlib::events::Event;
 use tsclientlib::{ClientId, Connection, DisconnectOptions, MessageTarget, StreamItem};
@@ -48,7 +45,7 @@ struct InfoJson {
     duration: Option<f64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Action {
     PlayAudio(String, ClientId),
     QueueNextAudio(String, ClientId),
@@ -108,32 +105,10 @@ async fn play_file(
     drop(state);
 
     // Extract Audio from Youtube using yt-dlp and pipe the output to stdout
-    let mut ytdlp_args = vec![
-        "--quiet",
-        "--extract-audio",
-        "--audio-format",
-        "opus",
-        "--audio-quality",
-        "48K",
-        "--buffer-size",
-        "16M",
-        "--socket-timeout",
-        "5",
-        "--write-info-json",
-        "--no-playlist",
-        "--output",
-        "-",
-    ];
-
-    if fs::metadata("cookies.txt").is_ok() {
-        ytdlp_args.push("--cookies");
-        ytdlp_args.push("cookies.txt");
-    }
-    ytdlp_args.push("--");
-    ytdlp_args.push(&link);
+    let args = ytdlp_args(&link, fs::metadata("cookies.txt").is_ok());
 
     let mut ytdlp = match Command::new("yt-dlp")
-        .args(&ytdlp_args)
+        .args(&args)
         .stdout(Stdio::piped())
         .spawn()
     {
@@ -351,40 +326,8 @@ async fn real_main() -> Result<()> {
         link: None,
     }));
 
-    let playback_state_clone1 = Arc::clone(&playback_state);
-    let playback_state_clone2 = Arc::clone(&playback_state);
+    let app = app(Arc::clone(&playback_state));
     tokio::spawn(async move {
-        let (layer, io) = SocketIo::new_layer();
-        io.ns("/", |s: SocketRef| async move {
-            info!("Client connected to Socket");
-            s.on_disconnect(|| async {
-                info!("Client disconnected");
-            });
-
-            tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-                loop {
-                    interval.tick().await;
-                    if !s.connected() {
-                        break;
-                    }
-                    let status = get_status(State(Arc::clone(&playback_state_clone2))).await;
-                    s.emit("status", &status.to_string()).ok();
-                }
-            });
-        });
-
-        let app = Router::new()
-            .route("/", get(|| async { "TSMusicbot is running!" }))
-            .route(
-                "/status",
-                get({
-                    let playback_state_clone = Arc::clone(&playback_state_clone1);
-                    move || get_status(State(playback_state_clone))
-                }),
-            )
-            .layer(layer);
-
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000")
             .await
             .unwrap_or_else(|e| panic!("Failed to bind to 0.0.0.0:3000: {}", e));
