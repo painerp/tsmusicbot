@@ -116,7 +116,7 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
     let stripped = msg.replace("[URL]", "").replace("[/URL]", "");
     let sanitized = sanitize(&stripped).trim().to_string();
 
-    if &sanitized[..=0] != "!" {
+    if !sanitized.starts_with('!') {
         return Action::None;
     }
 
@@ -240,4 +240,18 @@ pub async fn resolve_host(host: &str) -> Result<String> {
     }
 
     Ok(host.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_command_ignores_non_commands_without_panicking() {
+        // "" is what a poke without text sends; "^^" sanitizes to ""; "über" starts with a multi-byte char
+        for msg in ["", "^^", "über", "hello"] {
+            assert!(matches!(parse_command(msg, ClientId(1)), Action::None), "{:?}", msg);
+        }
+        assert!(matches!(parse_command("!stop", ClientId(1)), Action::Stop));
+    }
 }
