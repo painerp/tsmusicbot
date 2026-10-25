@@ -6,7 +6,6 @@ use chrono::Utc;
 use log::{error, info};
 use serde_json::json;
 use socketioxide::{extract::SocketRef, SocketIo};
-use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::sync::Arc;
@@ -229,27 +228,20 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 }
 
 pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<serde_json::Value> {
-    // clone so the lock isn't held while info.json is parsed; play_file skips time updates while locked
     let playback_state = state.lock().await.clone();
-    let mut duration: u32 = 0;
-
-    if fs::metadata("-.info.json").is_ok() && playback_state.link.clone().unwrap_or_default() != ""
-    {
-        duration = match read_info_json() {
-            Ok(info_json) => info_json.duration.unwrap_or(0.0) as u32,
-            Err(err) => {
-                error!("Failed to read info JSON: {}", err);
-                0
-            }
-        };
+    // while audio flows, extrapolate from the last frame so time is exact at timestamp
+    let mut time = playback_state.time_passed;
+    if playback_state.link.is_some() && !playback_state.paused && !playback_state.loading {
+        time += playback_state.updated.elapsed().as_secs_f64();
     }
 
     Json(json!({
-        "time": playback_state.time_passed,
+        "time": time,
         "timestamp": Utc::now().to_rfc3339(),
         "paused": playback_state.paused,
-        "duration": duration,
-        "link": playback_state.link.clone().unwrap_or_default(),
+        "loading": playback_state.loading,
+        "duration": playback_state.duration,
+        "link": playback_state.link.unwrap_or_default(),
     }))
 }
 
@@ -262,10 +254,15 @@ pub fn app(playback_state: Arc<Mutex<PlaybackState>>) -> Router {
             info!("Client disconnected");
         });
 
+        let changed = Arc::clone(&socket_state.lock().await.changed);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             loop {
-                interval.tick().await;
+                // every second, and right away when the link, loading or paused changes
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = changed.notified() => {}
+                }
                 if !s.connected() {
                     break;
                 }
@@ -413,12 +410,12 @@ mod tests {
         assert!(ytdlp_args("x", true).windows(2).any(|w| w == ["--cookies", "cookies.txt"]));
     }
 
+    // playing `link` from now on, or idle with None
     fn new_state(link: Option<&str>) -> Arc<Mutex<PlaybackState>> {
-        Arc::new(Mutex::new(PlaybackState {
-            time_passed: 0.0,
-            paused: false,
-            link: link.map(String::from),
-        }))
+        let mut state = PlaybackState::new();
+        state.set_link(link.map(String::from));
+        state.loading = false;
+        Arc::new(Mutex::new(state))
     }
 
     async fn serve(state: Arc<Mutex<PlaybackState>>) -> SocketAddr {
@@ -466,32 +463,38 @@ mod tests {
         let status: Value = serde_json::from_str(&body).unwrap();
         assert!(status["time"].is_f64(), "{}", status);
         assert!(status["paused"].is_boolean(), "{}", status);
+        assert!(status["loading"].is_boolean(), "{}", status);
         assert!(status["duration"].is_u64(), "{}", status);
         assert_eq!(status["link"], "");
         assert!(chrono::DateTime::parse_from_rfc3339(status["timestamp"].as_str().unwrap()).is_ok());
     }
 
-    #[tokio::test]
-    async fn status_duration_from_info_json() {
-        // yt-dlp writes -.info.json to the working directory; the only test that uses it
-        let dir = std::env::temp_dir().join(format!("tsmusicbot-test-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        std::env::set_current_dir(&dir).unwrap();
-        let link = Some("https://youtu.be/x");
-        let duration = |link| async move { get_status(State(new_state(link))).await.0["duration"].clone() };
+    #[tokio::test(start_paused = true)]
+    async fn status_time_runs_only_while_audio_plays() {
+        let state = new_state(Some("https://youtu.be/x"));
+        {
+            let mut s = state.lock().await;
+            s.time_passed = 1.0;
+            s.updated = tokio::time::Instant::now();
+            s.duration = 19;
+        }
+        let status = || async { get_status(State(Arc::clone(&state))).await.0 };
 
-        // song still starting, no file yet
-        assert_eq!(duration(link).await, 0);
-        fs::write("-.info.json", VIDEO).unwrap();
-        assert_eq!(duration(link).await, 2326);
-        // file left over from the previous song while idle
-        assert_eq!(duration(None).await, 0);
-        fs::write("-.info.json", LIVESTREAM).unwrap();
-        assert_eq!(duration(link).await, 0);
-        fs::write("-.info.json", DIRECT_LINK).unwrap();
-        assert_eq!(duration(link).await, 0);
-
-        fs::remove_dir_all(&dir).unwrap();
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let st = status().await;
+        assert_eq!((st["time"].as_f64(), st["duration"].as_u64()), (Some(1.5), Some(19)));
+        // paused and loading hold the clock where the audio stopped
+        state.lock().await.paused = true;
+        tokio::time::advance(Duration::from_millis(500)).await;
+        assert_eq!(status().await["time"], 1.0);
+        {
+            let mut s = state.lock().await;
+            s.paused = false;
+            s.loading = true;
+        }
+        tokio::time::advance(Duration::from_millis(500)).await;
+        let st = status().await;
+        assert_eq!((st["time"].as_f64(), st["loading"].as_bool()), (Some(1.0), Some(true)));
     }
 
     #[tokio::test]
@@ -514,6 +517,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[tokio::test]
+    async fn socket_emits_status_right_away_on_change() {
+        let state = new_state(None);
+        let addr = serve(Arc::clone(&state)).await;
+        let path = socket_connect(addr).await;
+        let mut body = String::new();
+        while !body.contains("42[") {
+            body = http(addr, "GET", &path, "").await.1;
+        }
+        // well before the next 1 s tick
+        let start = Instant::now();
+        state.lock().await.set_link(Some("https://youtu.be/y".to_string()));
+        let (_, body) = http(addr, "GET", &path, "").await;
+        assert!(body.contains("youtu.be/y") && body.contains(r#"\"loading\":true"#), "{}", body);
+        assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
     }
 
     #[tokio::test(flavor = "current_thread")]

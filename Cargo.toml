@@ -25,4 +25,4 @@ version = "2.7.0"
 features = ["max_level_trace", "release_max_level_info"]
 
 [dev-dependencies]
-tokio = { version = "1.42.0", features = ["io-util", "macros", "net", "rt-multi-thread", "rt", "signal"] }
+tokio = { version = "1.42.0", features = ["io-util", "macros", "net", "rt-multi-thread", "rt", "signal", "test-util"] }
