@@ -363,6 +363,9 @@ async fn real_main() -> Result<()> {
                 let mut interval = tokio::time::interval(Duration::from_secs(1));
                 loop {
                     interval.tick().await;
+                    if !s.connected() {
+                        break;
+                    }
                     let status = get_status(State(Arc::clone(&playback_state_clone2))).await;
                     s.emit("status", &status.to_string()).ok();
                 }
