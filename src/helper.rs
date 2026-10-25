@@ -120,7 +120,7 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
         return Action::None;
     }
 
-    let split_vec: Vec<&str> = sanitized.split(' ').collect();
+    let split_vec: Vec<&str> = sanitized.split_whitespace().collect();
 
     if split_vec[0] == "!stop" {
         info!("Stopping all tracks (requested by {})", user_id);
