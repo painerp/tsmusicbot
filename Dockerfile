@@ -48,5 +48,8 @@ COPY --chmod=755 entrypoint.sh /entrypoint.sh
 ENV RUST_LOG="error,tsmusicbot=info"
 
 EXPOSE 3000
+# the http server only starts once connected to TeamSpeak, and the bot exits when disconnected
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+    CMD wget -q -O /dev/null http://127.0.0.1:3000/ || exit 1
 ENTRYPOINT ["/entrypoint.sh"]
 CMD ["/app/tsmusicbot"]
