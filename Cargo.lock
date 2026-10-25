@@ -3057,7 +3057,6 @@ dependencies = [
  "anyhow",
  "audiopus",
  "axum",
- "byteorder",
  "chrono",
  "env_logger",
  "futures",

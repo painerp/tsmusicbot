@@ -76,11 +76,11 @@ pub fn read_info_json() -> Result<InfoJson> {
     Ok(info_json)
 }
 
-pub async fn cleanup_process(process: &mut std::process::Child, name: &str) -> () {
-    if let Err(e) = process.kill() {
+pub async fn cleanup_process(process: &mut tokio::process::Child, name: &str) -> () {
+    if let Err(e) = process.start_kill() {
         error!("Failed to kill {}: {}", name, e);
     }
-    match process.wait() {
+    match process.wait().await {
         Ok(status) => {
             if !status.success() && !status.code().is_none() {
                 error!("{} exited with non-zero status: {:?}", name, status.code());

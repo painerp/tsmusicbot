@@ -5,7 +5,6 @@ description = "A TeamSpeak3 music bot."
 edition = "2018"
 
 [dependencies]
-byteorder = "1.5.0"
 audiopus = "0.3.0-rc.0"
 serde = "1.0.217"
 serde_json = "1.0.135"

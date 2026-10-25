@@ -1,5 +1,4 @@
 extern crate audiopus;
-extern crate byteorder;
 extern crate serde;
 extern crate serde_json;
 mod helper;
@@ -7,17 +6,19 @@ mod helper;
 use anyhow::{bail, Result};
 use axum::extract::State;
 use axum::{routing::get, Router};
-use byteorder::{BigEndian, ReadBytesExt};
 use futures::prelude::*;
 use log::{debug, error, info, warn};
 use serde::Deserialize;
 use socketioxide::{extract::SocketRef, SocketIo};
 use std::collections::VecDeque;
+use std::convert::TryInto;
 use std::io::ErrorKind;
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{env, fs};
+use tokio::io::AsyncReadExt;
+use tokio::process::Command;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::{mpsc, Mutex};
 use tokio::time::{sleep, timeout, Duration};
@@ -145,6 +146,12 @@ async fn play_file(
         Ok(process) => process,
     };
 
+    let ytdlp_stdout: Stdio = ytdlp
+        .stdout
+        .take()
+        .and_then(|stdout| stdout.try_into().ok())
+        .unwrap_or_else(|| panic!("Failed to get stdout of yt-dlp"));
+
     let mut ffmpeg = match Command::new("ffmpeg")
         .args(&[
             "-loglevel",
@@ -159,12 +166,7 @@ async fn play_file(
             "s16be",
             "pipe:1",
         ])
-        .stdin(
-            ytdlp
-                .stdout
-                .take()
-                .unwrap_or_else(|| panic!("Failed to get stdout of yt-dlp")),
-        )
+        .stdin(ytdlp_stdout)
         .stdout(Stdio::piped())
         .spawn()
     {
@@ -180,6 +182,7 @@ async fn play_file(
     )
     .expect("Could not create encoder");
 
+    let mut pcm_bytes: [u8; FRAME_SIZE * 4] = [0; FRAME_SIZE * 4];
     let mut pcm_in_be: [i16; FRAME_SIZE * 2] = [0; FRAME_SIZE * 2];
     let mut opus_pkt: [u8; MAX_PACKET_SIZE] = [0; MAX_PACKET_SIZE];
 
@@ -222,7 +225,7 @@ async fn play_file(
             continue;
         }
 
-        match ffmpeg_stdout.read_i16_into::<BigEndian>(&mut pcm_in_be) {
+        match ffmpeg_stdout.read_exact(&mut pcm_bytes).await {
             Err(e) => {
                 if e.kind() == ErrorKind::UnexpectedEof {
                     debug!("ffmpeg_stdout: EOF");
@@ -235,8 +238,9 @@ async fn play_file(
         };
 
         // adjust volume and encode in opus
-        for i in 0..FRAME_SIZE * 2 {
-            pcm_in_be[i] = (pcm_in_be[i] as f32 * (current_volume * 0.2)) as i16;
+        for (sample, bytes) in pcm_in_be.iter_mut().zip(pcm_bytes.chunks_exact(2)) {
+            *sample =
+                (i16::from_be_bytes([bytes[0], bytes[1]]) as f32 * (current_volume * 0.2)) as i16;
         }
         let len = encoder
             .encode(&pcm_in_be, &mut opus_pkt[..])
