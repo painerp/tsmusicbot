@@ -119,6 +119,7 @@ async fn play_file(
         "--socket-timeout",
         "5",
         "--write-info-json",
+        "--no-playlist",
         "--output",
         "-",
     ];
@@ -127,6 +128,7 @@ async fn play_file(
         ytdlp_args.push("--cookies");
         ytdlp_args.push("cookies.txt");
     }
+    ytdlp_args.push("--");
     ytdlp_args.push(&link);
 
     let mut ytdlp = match Command::new("yt-dlp")
