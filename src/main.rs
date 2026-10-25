@@ -423,7 +423,13 @@ async fn real_main() -> Result<()> {
                     },
                     Some(action) => {
                         match action {
-                            Action::PlayAudio(link, user_id) => {
+                            Action::QueueNextAudio(link, user_id) if playing => {
+                                debug!("Queued");
+                                play_queue.push_front(link);
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), "Queued Link");
+                            },
+                            // when idle, queueing next means playing now
+                            Action::PlayAudio(link, user_id) | Action::QueueNextAudio(link, user_id) => {
                                 debug!("Playing");
                                 let msg: String;
                                 if !playing {
@@ -458,15 +464,6 @@ async fn real_main() -> Result<()> {
                                     msg = format!("Current Volume: {}", (volume * 100.0).floor());
                                 }
                                 send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
-                            },
-                            Action::QueueNextAudio(link, user_id) => {
-                                debug!("Queued");
-                                if playing {
-                                    play_queue.push_front(link);
-                                    send_ts_message(&mut init_con, MessageTarget::Client(user_id), "Queued Link");
-                                } else {
-                                    Action::PlayAudio(link, user_id);
-                                }
                             },
                             Action::Skip => {
                                 debug!("Skip");
