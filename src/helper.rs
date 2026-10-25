@@ -200,7 +200,8 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 }
 
 pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<serde_json::Value> {
-    let playback_state = state.lock().await;
+    // clone so the lock isn't held while info.json is parsed; play_file skips time updates while locked
+    let playback_state = state.lock().await.clone();
     let mut duration: u32 = 0;
 
     if fs::metadata("-.info.json").is_ok() && playback_state.link.clone().unwrap_or_default() != ""

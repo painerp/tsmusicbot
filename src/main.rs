@@ -276,12 +276,10 @@ async fn play_file(
             time_passed += Duration::from_micros(20031).as_secs_f64();
         }
 
-        let playback_state_clone = Arc::clone(&playback_state);
-        tokio::spawn(async move {
-            let mut state = playback_state_clone.lock().await;
+        // inline so it can't land after the reset below; try_lock so a status reader never stalls audio
+        if let Ok(mut state) = playback_state.try_lock() {
             state.time_passed = time_passed;
-            drop(state);
-        });
+        }
     }
 
     let mut state = playback_state.lock().await;
