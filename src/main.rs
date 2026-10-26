@@ -237,7 +237,6 @@ async fn play_file(
 ) {
     // otherwise the previous song's info.json reports its duration for this one
     let _ = fs::remove_file("-.info.json");
-    playback_state.lock().await.set_link(Some(link.clone()));
 
     // Extract Audio from Youtube using yt-dlp and pipe the output to stdout
     let args = ytdlp_args(&link, fs::metadata("cookies.txt").is_ok());
@@ -248,12 +247,10 @@ async fn play_file(
         .stderr(Stdio::piped())
         .spawn()
     {
-        Err(why) => {
-            let error = Some(format!("couldn't spawn yt-dlp: {}", why));
-            if let Err(e) = pkt_send.send(AudioPacket::Finished { played: false, error }).await {
-                error!("Status packet sending error: {}", e);
-            }
-            panic!("couldn't spawn yt-dlp: {}", why);
+        Err(e) => {
+            error!("couldn't spawn yt-dlp: {}", e);
+            send_finished(&pkt_send, false, Some(format!("couldn't spawn yt-dlp: {}", e))).await;
+            return;
         }
         Ok(process) => process,
     };
@@ -295,7 +292,12 @@ async fn play_file(
         .stdout(Stdio::piped())
         .spawn()
     {
-        Err(e) => panic!("couldn't spawn ffmpeg: {}", e),
+        Err(e) => {
+            error!("couldn't spawn ffmpeg: {}", e);
+            cleanup_process(&mut ytdlp, "yt-dlp").await;
+            send_finished(&pkt_send, false, Some(format!("couldn't spawn ffmpeg: {}", e))).await;
+            return;
+        }
         Ok(process) => process,
     };
 
@@ -333,8 +335,6 @@ async fn play_file(
 
     let sent = stream_frames(&mut frames, &pkt_send, &mut cmd_recv, volume, &playback_state).await;
 
-    playback_state.lock().await.set_link(None);
-
     debug!("Cleanup...");
     cmd_recv.close();
     cleanup_process(&mut ytdlp, "yt-dlp").await;
@@ -351,18 +351,24 @@ async fn play_file(
         Some(0) => (false, Some(ytdlp_error.unwrap_or_else(|| "yt-dlp delivered no audio".to_string()))),
         Some(_) => (true, ytdlp_error),
     };
+    send_finished(&pkt_send, played, error).await;
+}
+
+async fn send_finished(pkt_send: &mpsc::Sender<AudioPacket>, played: bool, error: Option<String>) {
     if let Err(e) = pkt_send.send(AudioPacket::Finished { played, error }).await {
         error!("Status packet sending error: {}", e);
     }
 }
 
-// starts play_file for a song and returns the channel to control it
-fn start_song(
+// makes link the current song and starts play_file for it; returns the channel to control it
+async fn start_song(
     link: &str,
     pkt_send: &mpsc::Sender<AudioPacket>,
     volume: f32,
     playback_state: &Arc<Mutex<PlaybackState>>,
 ) -> mpsc::Sender<PlayTaskCmd> {
+    // only the main loop sets the link, so a song change is one update with no idle gap between
+    playback_state.lock().await.set_link(Some(link.to_string()));
     let (cmd_send, cmd_recv) = mpsc::channel(4);
     tokio::spawn(play_file(
         link.to_string(),
@@ -584,7 +590,7 @@ async fn real_main() -> Result<()> {
                                 let msg = if current.is_none() {
                                     debug!("Playing");
                                     paused = false;
-                                    cmd_send = start_song(&song.link, &pkt_send, volume, &playback_state);
+                                    cmd_send = start_song(&song.link, &pkt_send, volume, &playback_state).await;
                                     let msg = format!("Loading {} ...", song.link);
                                     current = Some(song);
                                     msg
@@ -725,10 +731,13 @@ async fn real_main() -> Result<()> {
                             let msg = failure_message(song.name(), played, &error, detailed_errors);
                             outbox.push(song.requester, msg);
                         }
-                        if let Some(song) = play_queue.pop_front() {
-                            paused = false;
-                            cmd_send = start_song(&song.link, &pkt_send, volume, &playback_state);
-                            current = Some(song);
+                        match play_queue.pop_front() {
+                            Some(song) => {
+                                paused = false;
+                                cmd_send = start_song(&song.link, &pkt_send, volume, &playback_state).await;
+                                current = Some(song);
+                            }
+                            None => playback_state.lock().await.set_link(None),
                         }
                     },
                 }

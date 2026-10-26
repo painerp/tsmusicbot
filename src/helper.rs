@@ -116,6 +116,7 @@ const YTDLP_ERRORS: &[(&[&str], &str)] = &[
     (&["copyright"], "Blocked for copyright"),
     (&["DRM protected"], "DRM protected"),
     (&["delivered no audio"], "No playable audio"),
+    (&["couldn't spawn"], "The player failed to start"),
     (&["HTTP Error 403"], "Download refused (HTTP 403)"),
     (&["is not a valid URL", "Unsupported URL"], "Not a playable link"),
     (&["unavailable", "removed", "terminated", "no longer available", "HTTP Error 404"], "Unavailable"),
@@ -324,17 +325,21 @@ pub fn app(playback_state: Arc<Mutex<PlaybackState>>) -> Router {
         let changed = Arc::clone(&socket_state.lock().await.changed);
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
+            // the first tick is immediate; the loop sends the first status itself
+            interval.tick().await;
             loop {
-                // every second, and right away when the link, loading or paused changes
-                tokio::select! {
-                    _ = interval.tick() => {}
-                    _ = changed.notified() => {}
-                }
+                // armed before reading the state, so a change during the emit still wakes it
+                let notified = changed.notified();
                 if !s.connected() {
                     break;
                 }
                 let status = get_status(State(Arc::clone(&socket_state))).await;
                 s.emit("status", &status.to_string()).ok();
+                // every second, and right away when the link, loading or paused changes
+                tokio::select! {
+                    _ = interval.tick() => {}
+                    _ = notified => {}
+                }
             }
         });
     });
@@ -485,6 +490,7 @@ mod tests {
             ("[youtube] dQw4w9WgXcQ: Video unavailable. This video contains content from SME, who has blocked it on copyright grounds", "Blocked for copyright"),
             ("[youtube] dQw4w9WgXcQ: Video unavailable. This video is no longer available because the YouTube account associated with this video has been terminated.", "Unavailable"),
             ("unable to download video data: HTTP Error 403: Forbidden", "Download refused (HTTP 403)"),
+            ("couldn't spawn yt-dlp: No such file or directory (os error 2)", "The player failed to start"),
             ("something new", "Unknown error"),
         ] {
             assert_eq!(describe_ytdlp_error(error), reason, "{}", error);
