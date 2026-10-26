@@ -104,6 +104,73 @@ pub fn ytdlp_args(link: &str, cookies: bool) -> Vec<&str> {
     args
 }
 
+// First match wins, so the specific YouTube reasons come before the generic ones.
+const YTDLP_ERRORS: &[(&[&str], &str)] = &[
+    (&["HTTP Error 429", "Too Many Requests"], "Rate limited, try again later"),
+    (&["not a bot"], "Blocked by YouTube's bot check"),
+    (&["your country", "geo restriction", "from your location"], "Geoblocked"),
+    (&["confirm your age", "age-restricted", "inappropriate for some users"], "Age-restricted"),
+    (&["Private video"], "Private video"),
+    (&["members-only"], "Members-only"),
+    (&["live event will begin", "Premieres in", "Premiere will begin"], "Livestream hasn't started yet"),
+    (&["copyright"], "Blocked for copyright"),
+    (&["DRM protected"], "DRM protected"),
+    (&["delivered no audio"], "No playable audio"),
+    (&["HTTP Error 403"], "Download refused (HTTP 403)"),
+    (&["is not a valid URL", "Unsupported URL"], "Not a playable link"),
+    (&["unavailable", "removed", "terminated", "no longer available", "HTTP Error 404"], "Unavailable"),
+    (
+        &["timed out", "Connection refused", "resolve", "Name or service not known", "unreachable"],
+        "Network error",
+    ),
+];
+
+// A short reason for yt-dlp's ERROR line that's fine to show in chat.
+pub fn describe_ytdlp_error(error: &str) -> &'static str {
+    YTDLP_ERRORS
+        .iter()
+        .find(|(needles, _)| needles.iter().any(|needle| error.contains(needle)))
+        .map(|(_, reason)| *reason)
+        .unwrap_or("Unknown error")
+}
+
+pub fn failure_message(name: &str, played: bool, error: &str, detailed: bool) -> String {
+    let reason = describe_ytdlp_error(error);
+    let mut msg = if played {
+        format!("Stopped playing {} ({})", name, reason)
+    } else {
+        format!("Can't play {} currently ({})", name, reason)
+    };
+    if detailed {
+        msg += &format!("\n{}", error);
+    }
+    msg
+}
+
+pub fn now_playing_message(link: &str, info: Option<&InfoJson>) -> String {
+    let info = match info {
+        Some(info) => info,
+        None => return format!("Now playing: {}", link),
+    };
+    let mut msg = format!("Now playing: {}", info.title);
+    if !info.channel.is_empty() {
+        msg += &format!(" by {}", info.channel);
+    }
+    if let Some(duration) = info.duration {
+        msg += &format!(" ({})", format_duration(duration));
+    }
+    msg
+}
+
+pub fn format_duration(seconds: f64) -> String {
+    let s = seconds as u64;
+    if s >= 3600 {
+        format!("{}:{:02}:{:02}", s / 3600, s / 60 % 60, s % 60)
+    } else {
+        format!("{}:{:02}", s / 60, s % 60)
+    }
+}
+
 pub async fn cleanup_process(process: &mut tokio::process::Child, name: &str) -> () {
     if let Err(e) = process.start_kill() {
         error!("Failed to kill {}: {}", name, e);
@@ -152,11 +219,11 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 
     if split_vec[0] == "!stop" {
         info!("Stopping all tracks (requested by {})", user_id);
-        return Action::Stop;
+        return Action::Stop(user_id);
     }
 
     if split_vec[0] == "!pause" || split_vec[0] == "!p" {
-        return Action::Pause;
+        return Action::Pause(user_id);
     }
 
     if split_vec[0] == "!continue"
@@ -164,7 +231,7 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
         || split_vec[0] == "!resume"
         || split_vec[0] == "!r"
     {
-        return Action::Resume;
+        return Action::Resume(user_id);
     }
 
     if split_vec[0] == "!next" || split_vec[0] == "!n" {
@@ -172,11 +239,11 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
             info!("Queueing: {} (requested by {})", split_vec[1], user_id);
             return Action::QueueNextAudio(split_vec[1].to_string(), user_id);
         }
-        return Action::Skip;
+        return Action::Skip(user_id);
     }
 
     if split_vec[0] == "!skip" || split_vec[0] == "!s" {
-        return Action::Skip;
+        return Action::Skip(user_id);
     }
 
     if split_vec[0] == "!help" || split_vec[0] == "!h" {
@@ -229,14 +296,9 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 
 pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<serde_json::Value> {
     let playback_state = state.lock().await.clone();
-    // while audio flows, extrapolate from the last frame so time is exact at timestamp
-    let mut time = playback_state.time_passed;
-    if playback_state.link.is_some() && !playback_state.paused && !playback_state.loading {
-        time += playback_state.updated.elapsed().as_secs_f64();
-    }
 
     Json(json!({
-        "time": time,
+        "time": playback_state.position(),
         "timestamp": Utc::now().to_rfc3339(),
         "paused": playback_state.paused,
         "loading": playback_state.loading,
@@ -328,17 +390,17 @@ mod tests {
             ("!yt https://youtu.be/dQw4w9WgXcQ", Action::PlayAudio(link(), U)),
             ("!next https://youtu.be/dQw4w9WgXcQ", Action::QueueNextAudio(link(), U)),
             ("!n https://youtu.be/dQw4w9WgXcQ", Action::QueueNextAudio(link(), U)),
-            ("!next", Action::Skip),
-            ("!n", Action::Skip),
-            ("!skip", Action::Skip),
-            ("!s", Action::Skip),
-            ("!pause", Action::Pause),
-            ("!p", Action::Pause),
-            ("!resume", Action::Resume),
-            ("!r", Action::Resume),
-            ("!continue", Action::Resume),
-            ("!c", Action::Resume),
-            ("!stop", Action::Stop),
+            ("!next", Action::Skip(U)),
+            ("!n", Action::Skip(U)),
+            ("!skip", Action::Skip(U)),
+            ("!s", Action::Skip(U)),
+            ("!pause", Action::Pause(U)),
+            ("!p", Action::Pause(U)),
+            ("!resume", Action::Resume(U)),
+            ("!r", Action::Resume(U)),
+            ("!continue", Action::Resume(U)),
+            ("!c", Action::Resume(U)),
+            ("!stop", Action::Stop(U)),
             ("!info", Action::Info(U)),
             ("!i", Action::Info(U)),
             ("!help", Action::Help(U)),
@@ -394,6 +456,60 @@ mod tests {
         assert_eq!((live.channel.as_str(), live.duration), ("Lofi Girl", None));
         let direct: InfoJson = serde_json::from_str(DIRECT_LINK).unwrap();
         assert_eq!((direct.title.as_str(), direct.channel.as_str(), direct.duration), ("song", "", None));
+    }
+
+    #[test]
+    fn ytdlp_errors_get_a_short_reason() {
+        for (error, reason) in [
+            // captured from yt-dlp
+            ("[youtube] aaaaaaaaaaa: This video is unavailable", "Unavailable"),
+            ("[generic] 'notaurl' is not a valid URL", "Not a playable link"),
+            ("Unsupported URL: https://example.com/", "Not a playable link"),
+            ("[generic] x: Unable to download webpage: HTTPConnection(host='127.0.0.1', port=9): Failed to establish a new connection: [Errno 111] Connection refused", "Network error"),
+            ("[generic] missing: Unable to download webpage: HTTP Error 404: File not found (caused by <HTTPError 404: File not found>)", "Unavailable"),
+            ("[generic] x: Unable to download webpage: (<HTTPConnection(host='10.255.255.1', port=80) at 0x74f4bc8030e0>, 'Connection to 10.255.255.1 timed out. (connect timeout=5.0)')", "Network error"),
+            // YouTube's playability reasons as yt-dlp prints them
+            ("[youtube] dQw4w9WgXcQ: Unable to download API page: HTTP Error 429: Too Many Requests", "Rate limited, try again later"),
+            ("[youtube] dQw4w9WgXcQ: Sign in to confirm you\u{2019}re not a bot. Use --cookies-from-browser or --cookies for the authentication.", "Blocked by YouTube's bot check"),
+            ("[youtube] dQw4w9WgXcQ: Video unavailable. The uploader has not made this video available in your country", "Geoblocked"),
+            ("[youtube] dQw4w9WgXcQ: The requested video is not available from your location due to geo restriction", "Geoblocked"),
+            ("[youtube] dQw4w9WgXcQ: Sign in to confirm your age. This video may be inappropriate for some users.", "Age-restricted"),
+            ("[youtube] dQw4w9WgXcQ: Private video. Sign in if you've been granted access to this video", "Private video"),
+            ("[youtube] dQw4w9WgXcQ: Join this channel to get access to members-only content like this video, and other exclusive perks.", "Members-only"),
+            ("[youtube] dQw4w9WgXcQ: This live event will begin in 2 hours.", "Livestream hasn't started yet"),
+            ("[youtube] dQw4w9WgXcQ: Video unavailable. This video contains content from SME, who has blocked it on copyright grounds", "Blocked for copyright"),
+            ("[youtube] dQw4w9WgXcQ: Video unavailable. This video is no longer available because the YouTube account associated with this video has been terminated.", "Unavailable"),
+            ("unable to download video data: HTTP Error 403: Forbidden", "Download refused (HTTP 403)"),
+            ("something new", "Unknown error"),
+        ] {
+            assert_eq!(describe_ytdlp_error(error), reason, "{}", error);
+        }
+    }
+
+    #[test]
+    fn chat_messages() {
+        let error = "[youtube] x: HTTP Error 429: Too Many Requests";
+        assert_eq!(
+            failure_message("https://youtu.be/x", false, error, false),
+            "Can't play https://youtu.be/x currently (Rate limited, try again later)"
+        );
+        assert_eq!(
+            failure_message("Song", true, error, true),
+            format!("Stopped playing Song (Rate limited, try again later)\n{}", error)
+        );
+
+        let info = |json| serde_json::from_str::<InfoJson>(json).unwrap();
+        assert_eq!(
+            now_playing_message("x", Some(&info(VIDEO))),
+            "Now playing: 38C3 - Wir wissen wo dein Auto steht - Volksdaten von Volkswagen by media.ccc.de (38:46)"
+        );
+        assert!(now_playing_message("x", Some(&info(LIVESTREAM))).ends_with("by Lofi Girl"));
+        assert_eq!(now_playing_message("x", Some(&info(DIRECT_LINK))), "Now playing: song");
+        assert_eq!(now_playing_message("https://x", None), "Now playing: https://x");
+
+        assert_eq!(format_duration(0.0), "0:00");
+        assert_eq!(format_duration(59.9), "0:59");
+        assert_eq!(format_duration(3725.0), "1:02:05");
     }
 
     #[test]

@@ -13,15 +13,16 @@ use std::io::ErrorKind;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::{env, fs};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::signal::unix::SignalKind;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{sleep_until, Duration, Instant};
 
 use crate::helper::{
-    app, check_dependencies, cleanup_process, connect_to_ts, parse_command, read_config,
-    read_info_json, resolve_host, send_ts_message, ytdlp_args,
+    app, check_dependencies, cleanup_process, connect_to_ts, failure_message, format_duration,
+    now_playing_message, parse_command, read_config, read_info_json, resolve_host,
+    send_ts_message, ytdlp_args,
 };
 use tsclientlib::events::Event;
 use tsclientlib::{ClientId, Connection, DisconnectOptions, MessageTarget, StreamItem};
@@ -33,6 +34,9 @@ struct Config {
     password: String,
     name: String,
     id: String,
+    // show yt-dlp's exact error in chat, not only the short reason
+    #[serde(default)]
+    detailed_errors: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,10 +52,10 @@ struct InfoJson {
 enum Action {
     PlayAudio(String, ClientId),
     QueueNextAudio(String, ClientId),
-    Skip,
-    Pause,
-    Resume,
-    Stop,
+    Skip(ClientId),
+    Pause(ClientId),
+    Resume(ClientId),
+    Stop(ClientId),
     ChangeVolume { modifier: f32, user_id: ClientId },
     Info(ClientId),
     Help(ClientId),
@@ -70,7 +74,23 @@ enum PlayTaskCmd {
 #[derive(Debug)]
 enum AudioPacket {
     Payload(OutPacket),
-    None,
+    // the first audio is ready, with yt-dlp's info.json if it wrote one
+    Started(Option<InfoJson>),
+    // error is yt-dlp's message when the song failed, None when it ended or was stopped
+    Finished { played: bool, error: Option<String> },
+}
+
+// a link someone asked for
+struct Song {
+    link: String,
+    requester: ClientId,
+    title: Option<String>,
+}
+
+impl Song {
+    fn name(&self) -> &str {
+        self.title.as_deref().unwrap_or(&self.link)
+    }
 }
 
 #[derive(Clone)]
@@ -97,6 +117,15 @@ impl PlaybackState {
             duration: 0,
             link: None,
             changed: Arc::new(Notify::new()),
+        }
+    }
+
+    // seconds into the song as of now; the clock only runs while audio goes out
+    fn position(&self) -> f64 {
+        if self.link.is_some() && !self.paused && !self.loading {
+            self.time_passed + self.updated.elapsed().as_secs_f64()
+        } else {
+            self.time_passed
         }
     }
 
@@ -139,16 +168,31 @@ async fn play_file(
     let mut ytdlp = match Command::new("yt-dlp")
         .args(&args)
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
     {
         Err(why) => {
-            if let Err(e) = pkt_send.send(AudioPacket::None).await {
+            let error = Some(format!("couldn't spawn yt-dlp: {}", why));
+            if let Err(e) = pkt_send.send(AudioPacket::Finished { played: false, error }).await {
                 error!("Status packet sending error: {}", e);
             }
             panic!("couldn't spawn yt-dlp: {}", why);
         }
         Ok(process) => process,
     };
+
+    // keep yt-dlp's output in the log and its last ERROR to tell the requester
+    let mut ytdlp_stderr = BufReader::new(ytdlp.stderr.take().unwrap()).lines();
+    let ytdlp_error = tokio::spawn(async move {
+        let mut error = None;
+        while let Ok(Some(line)) = ytdlp_stderr.next_line().await {
+            warn!("yt-dlp: {}", line);
+            if let Some(message) = line.strip_prefix("ERROR: ") {
+                error = Some(message.to_string());
+            }
+        }
+        error
+    });
 
     let ytdlp_stdout: Stdio = ytdlp
         .stdout
@@ -182,7 +226,8 @@ async fn play_file(
     let (frame_send, mut frames) = mpsc::channel::<Pcm>(50);
     let mut ffmpeg_stdout = ffmpeg.stdout.take().unwrap();
     let reader_state = Arc::clone(&playback_state);
-    tokio::spawn(async move {
+    let started_send = pkt_send.clone();
+    let reader = tokio::spawn(async move {
         let mut pcm: Pcm = [0; FRAME_SIZE * 4];
         let mut first_frame = true;
         loop {
@@ -197,9 +242,11 @@ async fn play_file(
             if first_frame {
                 first_frame = false;
                 // yt-dlp writes this song's info.json before it starts downloading
-                if let Ok(info_json) = read_info_json() {
+                let info_json = read_info_json().ok();
+                if let Some(info_json) = &info_json {
                     reader_state.lock().await.duration = info_json.duration.unwrap_or(0.0) as u32;
                 }
+                let _ = started_send.send(AudioPacket::Started(info_json)).await;
             }
             if frame_send.send(pcm).await.is_err() {
                 break;
@@ -207,30 +254,59 @@ async fn play_file(
         }
     });
 
-    stream_frames(&mut frames, &pkt_send, &mut cmd_recv, volume, &playback_state).await;
+    let sent = stream_frames(&mut frames, &pkt_send, &mut cmd_recv, volume, &playback_state).await;
 
     playback_state.lock().await.set_link(None);
 
     debug!("Cleanup...");
-    if let Err(e) = pkt_send.send(AudioPacket::None).await {
-        error!("Status packet sending error: {}", e);
-        return;
-    }
     cmd_recv.close();
-
     cleanup_process(&mut ytdlp, "yt-dlp").await;
     cleanup_process(&mut ffmpeg, "ffmpeg").await;
+
+    // the reader may still announce a start; let it finish so that can't come after Finished
+    drop(frames);
+    let _ = reader.await;
+    // yt-dlp has exited, so its stderr is complete
+    let ytdlp_error = ytdlp_error.await.unwrap_or(None);
+    let (played, error) = match sent {
+        // stopped by a command
+        None => (true, None),
+        Some(0) => (false, Some(ytdlp_error.unwrap_or_else(|| "yt-dlp delivered no audio".to_string()))),
+        Some(_) => (true, ytdlp_error),
+    };
+    if let Err(e) = pkt_send.send(AudioPacket::Finished { played, error }).await {
+        error!("Status packet sending error: {}", e);
+    }
+}
+
+// starts play_file for a song and returns the channel to control it
+fn start_song(
+    link: &str,
+    pkt_send: &mpsc::Sender<AudioPacket>,
+    volume: f32,
+    playback_state: &Arc<Mutex<PlaybackState>>,
+) -> mpsc::Sender<PlayTaskCmd> {
+    let (cmd_send, cmd_recv) = mpsc::channel(4);
+    tokio::spawn(play_file(
+        link.to_string(),
+        pkt_send.clone(),
+        cmd_recv,
+        volume,
+        Arc::clone(playback_state),
+    ));
+    cmd_send
 }
 
 // Sends frame n at start + n * 20 ms. A fixed schedule keeps the audio and the reported time on the
 // wall clock; sleeping a fixed time after each frame drifted by seconds per minute under load.
+// Returns how many frames went out, or None when a command stopped it.
 async fn stream_frames(
     frames: &mut mpsc::Receiver<Pcm>,
     pkt_send: &mpsc::Sender<AudioPacket>,
     cmd_recv: &mut mpsc::Receiver<PlayTaskCmd>,
     mut volume: f32,
     playback_state: &Mutex<PlaybackState>,
-) {
+) -> Option<u32> {
     let encoder = audiopus::coder::Encoder::new(
         audiopus::SampleRate::Hz48000,
         audiopus::Channels::Stereo,
@@ -249,7 +325,7 @@ async fn stream_frames(
         tokio::select! {
             biased;
             cmd = cmd_recv.recv() => match cmd {
-                None | Some(PlayTaskCmd::Stop) => break,
+                None | Some(PlayTaskCmd::Stop) => return None,
                 Some(PlayTaskCmd::ChangeVolume { modifier }) => volume = modifier,
                 Some(PlayTaskCmd::Pause) => {
                     paused = true;
@@ -264,7 +340,7 @@ async fn stream_frames(
             pcm = frames.recv(), if !paused => {
                 let pcm = match pcm {
                     Some(pcm) => pcm,
-                    None => break,
+                    None => return Some(sent),
                 };
                 if loading {
                     // first audio of the song or after a stall: the schedule starts now
@@ -293,7 +369,7 @@ async fn stream_frames(
                 report(playback_state, sent, paused, loading).await;
                 if let Err(e) = pkt_send.send(AudioPacket::Payload(packet)).await {
                     error!("Audio packet sending error: {}", e);
-                    break;
+                    return None;
                 }
                 sent += 1;
                 next += FRAME;
@@ -343,6 +419,7 @@ async fn real_main() -> Result<()> {
         config_json.host = resolve_host(&config_json.host).await?;
     }
 
+    let detailed_errors = config_json.detailed_errors;
     let mut init_con: Connection = connect_to_ts(config_json);
 
     let r = init_con
@@ -358,13 +435,13 @@ async fn real_main() -> Result<()> {
 
     let (pkt_send, mut pkt_recv) = mpsc::channel(64);
     let (status_send, mut status_recv) = mpsc::channel(64);
-    let mut playing: bool = false;
     let mut paused: bool = false;
     let mut volume: f32 = DEFAULT_VOLUME;
-    let mut current_playing_link: Option<String> = None;
+    // the song play_file is working on, None when idle
+    let mut current: Option<Song> = None;
 
     let (mut cmd_send, _cmd_recv) = mpsc::channel(4);
-    let mut play_queue: VecDeque<String> = VecDeque::new();
+    let mut play_queue: VecDeque<Song> = VecDeque::new();
 
     let playback_state = Arc::new(Mutex::new(PlaybackState::new()));
 
@@ -414,93 +491,118 @@ async fn real_main() -> Result<()> {
                     },
                     Some(action) => {
                         match action {
-                            Action::QueueNextAudio(link, user_id) if playing => {
-                                debug!("Queued");
-                                play_queue.push_front(link);
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), "Queued Link");
+                            Action::QueueNextAudio(link, user_id) if current.is_some() => {
+                                debug!("Queued next");
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &format!("Playing next: {}", link));
+                                play_queue.push_front(Song { link, requester: user_id, title: None });
                             },
                             // when idle, queueing next means playing now
                             Action::PlayAudio(link, user_id) | Action::QueueNextAudio(link, user_id) => {
-                                debug!("Playing");
-                                let msg: String;
-                                if !playing {
-                                    playing = true;
+                                let song = Song { link, requester: user_id, title: None };
+                                let msg = if current.is_none() {
+                                    debug!("Playing");
                                     paused = false;
-                                    let audio_task_pkt_send = pkt_send.clone();
-
-                                    let (task_cmd_send,  task_cmd_recv) = mpsc::channel(4);
-
-                                    cmd_send = task_cmd_send;
-
-                                    current_playing_link = Some(link.clone());
-                                    let playback_state_clone = Arc::clone(&playback_state);
-                                    tokio::spawn(async move {
-                                        play_file(link, audio_task_pkt_send, task_cmd_recv, volume, playback_state_clone).await;
-                                    });
-                                    msg = "Playing Link".to_string();
+                                    cmd_send = start_song(&song.link, &pkt_send, volume, &playback_state);
+                                    let msg = format!("Loading {} ...", song.link);
+                                    current = Some(song);
+                                    msg
                                 } else {
-                                    play_queue.push_back(link);
-                                    msg = "Queued Link".to_string();
-                                }
+                                    debug!("Queued");
+                                    let msg = format!("Queued as #{}: {}", play_queue.len() + 1, song.link);
+                                    play_queue.push_back(song);
+                                    msg
+                                };
                                 send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
                             Action::ChangeVolume {modifier, user_id} => {
                                 debug!("Change volume");
-                                let msg: String;
-                                if modifier > 0.0 && modifier <= 1.0 {
+                                let msg = if modifier > 0.0 && modifier <= 1.0 {
                                     volume = modifier;
-                                    if playing { let _ = cmd_send.send(PlayTaskCmd::ChangeVolume {modifier}).await; };
-                                    msg = format!("Volume set to: {}", (modifier * 100.0).floor());
+                                    if current.is_some() { let _ = cmd_send.send(PlayTaskCmd::ChangeVolume {modifier}).await; };
+                                    format!("Volume set to {}%", (modifier * 100.0).round())
                                 } else {
-                                    msg = format!("Current Volume: {}", (volume * 100.0).floor());
-                                }
+                                    format!("Volume is {}%", (volume * 100.0).round())
+                                };
                                 send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
-                            Action::Skip => {
+                            Action::Skip(user_id) => {
                                 debug!("Skip");
-                                if playing {
-                                    paused = false;
-                                    let _ = cmd_send.send(PlayTaskCmd::Stop).await;
+                                let msg = match &current {
+                                    Some(song) => {
+                                        paused = false;
+                                        let _ = cmd_send.send(PlayTaskCmd::Stop).await;
+                                        format!("Skipped {}", song.name())
+                                    }
+                                    None => "Nothing is playing".to_string(),
                                 };
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
-                            Action::Resume => {
+                            Action::Resume(user_id) => {
                                 debug!("Resume");
-                                if playing && paused {
-                                    paused = false;
-                                    let _ = cmd_send.send(PlayTaskCmd::Resume).await;
+                                let msg = match &current {
+                                    Some(song) if paused => {
+                                        paused = false;
+                                        let _ = cmd_send.send(PlayTaskCmd::Resume).await;
+                                        format!("Resumed {}", song.name())
+                                    }
+                                    Some(_) => "Not paused".to_string(),
+                                    None => "Nothing is playing".to_string(),
                                 };
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
-                            Action::Pause => {
+                            Action::Pause(user_id) => {
                                 debug!("Pause");
-                                if playing && !paused {
-                                    paused = true;
-                                    let _ = cmd_send.send(PlayTaskCmd::Pause).await;
+                                let msg = match &current {
+                                    Some(song) if !paused => {
+                                        paused = true;
+                                        let _ = cmd_send.send(PlayTaskCmd::Pause).await;
+                                        format!("Paused {}", song.name())
+                                    }
+                                    Some(_) => "Already paused".to_string(),
+                                    None => "Nothing is playing".to_string(),
                                 };
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
-                            Action::Stop => {
+                            Action::Stop(user_id) => {
                                 debug!("Stop");
-                                if playing {
+                                let msg = if current.is_some() {
                                     paused = false;
+                                    let cleared = play_queue.len();
                                     play_queue.clear();
                                     let _ = cmd_send.send(PlayTaskCmd::Stop).await;
+                                    match cleared {
+                                        0 => "Stopped".to_string(),
+                                        1 => "Stopped and cleared 1 queued song".to_string(),
+                                        n => format!("Stopped and cleared {} queued songs", n),
+                                    }
+                                } else {
+                                    "Nothing is playing".to_string()
                                 };
+                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
                             Action::Info(user_id) => {
                                 debug!("Info");
-                                let mut msg = "\nCurrently Playing:\n".to_owned();
-                                if playing {
-                                    let link = current_playing_link.clone().unwrap_or_default();
-                                    match read_info_json() {
-                                        Ok(info_json) => {
-                                            msg += &format!("Title: {}\nChannel: {}\nLink: {}", info_json.title, info_json.channel, link);
+                                let msg = match &current {
+                                    Some(song) => {
+                                        let state = playback_state.lock().await.clone();
+                                        let mut progress = if state.loading {
+                                            "Loading ...".to_string()
+                                        } else if state.duration > 0 {
+                                            format!("{} / {}", format_duration(state.position()), format_duration(state.duration as f64))
+                                        } else {
+                                            format_duration(state.position())
+                                        };
+                                        if paused {
+                                            progress += " (paused)";
                                         }
-                                        Err(_) => {
-                                            msg += &format!("{}", link);
+                                        let mut msg = format!("\nNow playing: {}\n{}\n{}", song.name(), progress, song.link);
+                                        if !play_queue.is_empty() {
+                                            msg += &format!("\n{} more in the queue", play_queue.len());
                                         }
+                                        msg
                                     }
-                                } else {
-                                    msg += &"Nothing".to_owned();
-                                }
+                                    None => "Nothing is playing".to_string(),
+                                };
                                 send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
                             },
                             Action::Help(user_id) => {
@@ -521,37 +623,32 @@ async fn real_main() -> Result<()> {
             val = pkt_recv.recv() => {
                 match val {
                     None => {},
-                    Some(msg) => {
-                        if playing {
-
-                            match msg {
-                                AudioPacket::Payload(pkt) => {
-                                    if let Err(e) = init_con.send_audio(pkt) {
-                                        error!("Audio packet sending error: {}", e);
-                                        break;
-                                    }
-                                },
-                                AudioPacket::None => {
-                                    if play_queue.is_empty(){
-                                        playing = false;
-                                    } else {
-                                        let link = play_queue.pop_front().unwrap();
-                                        let audio_task_pkt_send = pkt_send.clone();
-
-                                        let (task_cmd_send,  task_cmd_recv) = mpsc::channel(4);
-
-                                        cmd_send = task_cmd_send;
-
-                                        current_playing_link = Some(link.clone());
-                                        let playback_state_clone = Arc::clone(&playback_state);
-                                        tokio::spawn(async move {
-                                            play_file(link, audio_task_pkt_send, task_cmd_recv, volume, playback_state_clone).await;
-                                        });
-                                    }
-                                }
+                    Some(AudioPacket::Payload(pkt)) => {
+                        if current.is_some() {
+                            if let Err(e) = init_con.send_audio(pkt) {
+                                error!("Audio packet sending error: {}", e);
+                                break;
                             }
                         }
-                    }
+                    },
+                    Some(AudioPacket::Started(info)) => {
+                        if let Some(song) = current.as_mut() {
+                            let msg = now_playing_message(&song.link, info.as_ref());
+                            song.title = info.map(|info| info.title);
+                            send_ts_message(&mut init_con, MessageTarget::Client(song.requester), &msg);
+                        }
+                    },
+                    Some(AudioPacket::Finished { played, error }) => {
+                        if let (Some(song), Some(error)) = (current.take(), error) {
+                            let msg = failure_message(song.name(), played, &error, detailed_errors);
+                            send_ts_message(&mut init_con, MessageTarget::Client(song.requester), &msg);
+                        }
+                        if let Some(song) = play_queue.pop_front() {
+                            paused = false;
+                            cmd_send = start_song(&song.link, &pkt_send, volume, &playback_state);
+                            current = Some(song);
+                        }
+                    },
                 }
             }
 

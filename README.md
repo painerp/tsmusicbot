@@ -89,6 +89,8 @@ The bot is configured using a simple JSON file containing the following paramete
 - `password` - Server password (if any).
 - `name` - Nickname for the bot.
 - `id` - Base64-encoded unique user ID.
+- `detailed_errors` - Optional, default `false`. When a link can't be played, the bot tells the requester a short reason
+  (e.g. `Geoblocked`, `Rate limited, try again later`). Set this to `true` to also show yt-dlp's exact error message.
 
 ### Example `config.json`:
 
@@ -97,7 +99,8 @@ The bot is configured using a simple JSON file containing the following paramete
   "host": "example.ts3server.com",
   "password": "",
   "name": "MusicBot",
-  "id": "<base64 string>"
+  "id": "<base64 string>",
+  "detailed_errors": false
 }
 ```
 
