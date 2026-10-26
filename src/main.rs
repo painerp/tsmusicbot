@@ -25,7 +25,10 @@ use crate::helper::{
     send_ts_message, ytdlp_args,
 };
 use tsclientlib::events::Event;
-use tsclientlib::{ClientId, Connection, DisconnectOptions, MessageTarget, StreamItem};
+use tsclientlib::{
+    ClientId, CommandError, Connection, DisconnectOptions, MessageHandle, MessageTarget, StreamItem,
+    TsError,
+};
 use tsproto_packets::packets::{AudioData, CodecType, OutAudio, OutPacket};
 
 #[derive(Debug, Deserialize)]
@@ -93,6 +96,73 @@ impl Song {
     }
 }
 
+// Private chat replies, one at a time: the next waits until the server accepted the last, so a
+// reply the anti-flood rejected is sent again later without losing its place.
+struct Outbox {
+    queue: VecDeque<(ClientId, String)>,
+    in_flight: Option<(MessageHandle, Instant)>,
+    next: Instant,
+    backoff: Duration,
+}
+
+impl Outbox {
+    fn new() -> Self {
+        Outbox {
+            queue: VecDeque::new(),
+            in_flight: None,
+            next: Instant::now(),
+            backoff: FLOOD_BACKOFF,
+        }
+    }
+
+    fn push(&mut self, user_id: ClientId, msg: String) {
+        self.queue.push_back((user_id, msg));
+    }
+
+    // when send should run next, None while there is nothing to send
+    fn due(&self) -> Option<Instant> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        Some(match self.in_flight {
+            Some((_, sent)) => sent + ANSWER_TIMEOUT,
+            None => self.next,
+        })
+    }
+
+    fn send(&mut self, send: impl FnOnce(ClientId, &str) -> Option<MessageHandle>) {
+        if self.in_flight.take().is_some() {
+            warn!("No answer to a chat message, sending the next one");
+            self.queue.pop_front();
+        }
+        if let Some((user_id, msg)) = self.queue.front() {
+            self.in_flight = send(*user_id, msg).map(|handle| (handle, Instant::now()));
+            if self.in_flight.is_none() {
+                self.queue.pop_front();
+            }
+        }
+        self.next = Instant::now() + REPLY_INTERVAL;
+    }
+
+    fn answered(&mut self, handle: MessageHandle, result: Result<(), CommandError>) {
+        if self.in_flight.map(|(h, _)| h) != Some(handle) {
+            return;
+        }
+        self.in_flight = None;
+        match result {
+            Err(e) if e.error == TsError::ClientIsFlooding => {
+                self.next = Instant::now() + self.backoff;
+                self.backoff = (self.backoff * 2).min(MAX_FLOOD_BACKOFF);
+                return;
+            }
+            Err(e) => warn!("Chat message rejected: {}", e),
+            Ok(()) => {}
+        }
+        self.queue.pop_front();
+        self.backoff = FLOOD_BACKOFF;
+    }
+}
+
 #[derive(Clone)]
 struct PlaybackState {
     time_passed: f64,
@@ -147,6 +217,13 @@ const FRAME: Duration = Duration::from_millis(20); // FRAME_SIZE samples at 48 k
 const MAX_PACKET_SIZE: usize = 3 * 1276;
 // a frame this late means yt-dlp stalled
 const STALL: Duration = Duration::from_millis(100);
+// TeamSpeak's anti-flood rejects a client's chat messages when it sends too many
+const REPLY_INTERVAL: Duration = Duration::from_secs(1);
+// rejected attempts count too, so the pause doubles until the server accepts again
+const FLOOD_BACKOFF: Duration = Duration::from_secs(2);
+const MAX_FLOOD_BACKOFF: Duration = Duration::from_secs(30);
+// the server answers every message; without an answer (e.g. a reconnect) move on
+const ANSWER_TIMEOUT: Duration = Duration::from_secs(5);
 
 // one frame of s16be stereo pcm
 type Pcm = [u8; FRAME_SIZE * 4];
@@ -435,6 +512,7 @@ async fn real_main() -> Result<()> {
 
     let (pkt_send, mut pkt_recv) = mpsc::channel(64);
     let (status_send, mut status_recv) = mpsc::channel(64);
+    let (result_send, mut result_recv) = mpsc::channel(64);
     let mut paused: bool = false;
     let mut volume: f32 = DEFAULT_VOLUME;
     // the song play_file is working on, None when idle
@@ -442,6 +520,7 @@ async fn real_main() -> Result<()> {
 
     let (mut cmd_send, _cmd_recv) = mpsc::channel(4);
     let mut play_queue: VecDeque<Song> = VecDeque::new();
+    let mut outbox = Outbox::new();
 
     let playback_state = Arc::new(Mutex::new(PlaybackState::new()));
 
@@ -477,6 +556,9 @@ async fn real_main() -> Result<()> {
                         }
                     }
                 }
+                StreamItem::MessageResult(handle, result) => {
+                    let _ = result_send.send((handle, result)).await;
+                }
                 _ => {}
             };
             Ok(())
@@ -493,7 +575,7 @@ async fn real_main() -> Result<()> {
                         match action {
                             Action::QueueNextAudio(link, user_id) if current.is_some() => {
                                 debug!("Queued next");
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &format!("Playing next: {}", link));
+                                outbox.push(user_id, format!("Playing next: {}", link));
                                 play_queue.push_front(Song { link, requester: user_id, title: None });
                             },
                             // when idle, queueing next means playing now
@@ -512,7 +594,7 @@ async fn real_main() -> Result<()> {
                                     play_queue.push_back(song);
                                     msg
                                 };
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
+                                outbox.push(user_id, msg);
                             },
                             Action::ChangeVolume {modifier, user_id} => {
                                 debug!("Change volume");
@@ -523,7 +605,7 @@ async fn real_main() -> Result<()> {
                                 } else {
                                     format!("Volume is {}%", (volume * 100.0).round())
                                 };
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
+                                outbox.push(user_id, msg);
                             },
                             Action::Skip(user_id) => {
                                 debug!("Skip");
@@ -535,7 +617,7 @@ async fn real_main() -> Result<()> {
                                     }
                                     None => "Nothing is playing".to_string(),
                                 };
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
+                                outbox.push(user_id, msg);
                             },
                             Action::Resume(user_id) => {
                                 debug!("Resume");
@@ -548,7 +630,7 @@ async fn real_main() -> Result<()> {
                                     Some(_) => "Not paused".to_string(),
                                     None => "Nothing is playing".to_string(),
                                 };
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
+                                outbox.push(user_id, msg);
                             },
                             Action::Pause(user_id) => {
                                 debug!("Pause");
@@ -561,7 +643,7 @@ async fn real_main() -> Result<()> {
                                     Some(_) => "Already paused".to_string(),
                                     None => "Nothing is playing".to_string(),
                                 };
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
+                                outbox.push(user_id, msg);
                             },
                             Action::Stop(user_id) => {
                                 debug!("Stop");
@@ -578,7 +660,7 @@ async fn real_main() -> Result<()> {
                                 } else {
                                     "Nothing is playing".to_string()
                                 };
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
+                                outbox.push(user_id, msg);
                             },
                             Action::Info(user_id) => {
                                 debug!("Info");
@@ -603,12 +685,12 @@ async fn real_main() -> Result<()> {
                                     }
                                     None => "Nothing is playing".to_string(),
                                 };
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
+                                outbox.push(user_id, msg);
                             },
                             Action::Help(user_id) => {
                                 debug!("Help");
                                 let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link> or !n <link> - Queue a track as the next track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip, !s, !next, or !n - Skip current track\n!stop - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume (modifier should be a number from 0 to 100)\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
-                                send_ts_message(&mut init_con, MessageTarget::Client(user_id), &msg);
+                                outbox.push(user_id, msg);
                             },
                             Action::Quit => {
                                 debug!("Quit");
@@ -635,13 +717,13 @@ async fn real_main() -> Result<()> {
                         if let Some(song) = current.as_mut() {
                             let msg = now_playing_message(&song.link, info.as_ref());
                             song.title = info.map(|info| info.title);
-                            send_ts_message(&mut init_con, MessageTarget::Client(song.requester), &msg);
+                            outbox.push(song.requester, msg);
                         }
                     },
                     Some(AudioPacket::Finished { played, error }) => {
                         if let (Some(song), Some(error)) = (current.take(), error) {
                             let msg = failure_message(song.name(), played, &error, detailed_errors);
-                            send_ts_message(&mut init_con, MessageTarget::Client(song.requester), &msg);
+                            outbox.push(song.requester, msg);
                         }
                         if let Some(song) = play_queue.pop_front() {
                             paused = false;
@@ -651,6 +733,12 @@ async fn real_main() -> Result<()> {
                     },
                 }
             }
+
+            _ = sleep_until(outbox.due().unwrap_or_else(Instant::now)), if outbox.due().is_some() => {
+                outbox.send(|user_id, msg| send_ts_message(&mut init_con, MessageTarget::Client(user_id), msg));
+            }
+
+            Some((handle, result)) = result_recv.recv() => outbox.answered(handle, result),
 
             _ = tokio::signal::ctrl_c() => {
                 info!("Received Ctrl+C signal, shutting down...");
@@ -791,6 +879,64 @@ mod tests {
         let at = p.sent(10).await;
         assert_eq!(at[9] - at[0], FRAME * 9);
         assert_eq!(p.status().await, (position(played + 9), false, false));
+    }
+
+    fn flooding() -> Result<(), CommandError> {
+        Err(CommandError { error: TsError::ClientIsFlooding, missing_permission: None })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outbox_resends_flood_rejected_replies_in_order() {
+        let mut outbox = Outbox::new();
+        let mut sent = Vec::new();
+        let mut send = |outbox: &mut Outbox| {
+            let mut handle = None;
+            outbox.send(|_, msg| {
+                sent.push(msg.to_string());
+                handle = Some(MessageHandle(sent.len() as u16));
+                handle
+            });
+            handle.unwrap()
+        };
+        outbox.push(ClientId(1), "a".to_string());
+        outbox.push(ClientId(1), "b".to_string());
+        assert_eq!(outbox.due(), Some(Instant::now()));
+
+        let a = send(&mut outbox);
+        // waits for the server's answer before sending b
+        assert_eq!(outbox.due(), Some(Instant::now() + ANSWER_TIMEOUT));
+        outbox.answered(a, flooding());
+        assert_eq!(outbox.due(), Some(Instant::now() + FLOOD_BACKOFF));
+        let a = send(&mut outbox);
+        outbox.answered(a, flooding());
+        // rejected again: the pause doubles
+        assert_eq!(outbox.due(), Some(Instant::now() + FLOOD_BACKOFF * 2));
+        let a = send(&mut outbox);
+        outbox.answered(a, Ok(()));
+        assert_eq!(outbox.due(), Some(Instant::now() + REPLY_INTERVAL));
+        let b = send(&mut outbox);
+        outbox.answered(b, Ok(()));
+        assert_eq!(outbox.due(), None);
+        assert_eq!(sent, ["a", "a", "a", "b"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outbox_moves_on_without_an_answer() {
+        let mut outbox = Outbox::new();
+        let mut sent = Vec::new();
+        outbox.push(ClientId(1), "a".to_string());
+        outbox.push(ClientId(1), "b".to_string());
+        outbox.send(|_, msg| {
+            sent.push(msg.to_string());
+            Some(MessageHandle(1))
+        });
+        // e.g. lost in a reconnect
+        sleep(ANSWER_TIMEOUT).await;
+        outbox.send(|_, msg| {
+            sent.push(msg.to_string());
+            Some(MessageHandle(2))
+        });
+        assert_eq!(sent, ["a", "b"]);
     }
 
     #[tokio::test(start_paused = true)]

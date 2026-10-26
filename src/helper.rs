@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::lookup_host;
 use tokio::sync::Mutex;
-use tsclientlib::{ClientId, Connection, Identity, MessageTarget, OutCommandExt};
+use tsclientlib::{ClientId, Connection, Identity, MessageHandle, MessageTarget, OutCommandExt};
 use which::which;
 
 pub fn check_dependencies() -> () {
@@ -185,13 +185,18 @@ pub async fn cleanup_process(process: &mut tokio::process::Child, name: &str) ->
     }
 }
 
-pub fn send_ts_message(con: &mut Connection, target: MessageTarget, msg: &str) -> () {
+// The server answers later with a StreamItem::MessageResult for the returned handle.
+pub fn send_ts_message(con: &mut Connection, target: MessageTarget, msg: &str) -> Option<MessageHandle> {
     let state = con.get_state().unwrap_or_else(|e| {
         panic!("Unable to get state: {}", e);
     });
 
-    if let Err(e) = state.send_message(target, &msg).send_with_result(con) {
-        error!("Message sending error: {}", e);
+    match state.send_message(target, &msg).send_with_result(con) {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            error!("Message sending error: {}", e);
+            None
+        }
     }
 }
 

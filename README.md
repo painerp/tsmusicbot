@@ -92,6 +92,10 @@ The bot is configured using a simple JSON file containing the following paramete
 - `detailed_errors` - Optional, default `false`. When a link can't be played, the bot tells the requester a short reason
   (e.g. `Geoblocked`, `Rate limited, try again later`). Set this to `true` to also show yt-dlp's exact error message.
 
+The bot answers commands with private chat messages. TeamSpeak's anti-flood rejects messages from clients that send
+many in a short time; the bot then waits and sends them again, so on a busy server replies can arrive late. Giving the
+bot's server group the **Ignore Anti-Flood** permission (`b_client_ignore_antiflood`) avoids that.
+
 ### Example `config.json`:
 
 ```json
