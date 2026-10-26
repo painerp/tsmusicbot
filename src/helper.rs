@@ -301,16 +301,36 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 }
 
 pub async fn get_status(State(state): State<Arc<Mutex<PlaybackState>>>) -> Json<serde_json::Value> {
-    let playback_state = state.lock().await.clone();
+    Json(status_json(&*state.lock().await))
+}
 
-    Json(json!({
-        "time": playback_state.position(),
+pub fn status_json(state: &PlaybackState) -> serde_json::Value {
+    json!({
+        "time": state.position(),
         "timestamp": Utc::now().to_rfc3339(),
-        "paused": playback_state.paused,
-        "loading": playback_state.loading,
-        "duration": playback_state.duration,
-        "link": playback_state.link.unwrap_or_default(),
-    }))
+        "paused": state.paused,
+        "loading": state.loading,
+        "duration": state.duration,
+        "link": state.link.clone().unwrap_or_default(),
+        "entry_id": state.entry_id,
+        "queued_by": state.queued_by,
+    })
+}
+
+pub fn queue_json(state: &PlaybackState) -> serde_json::Value {
+    let entries: Vec<serde_json::Value> = state
+        .queue
+        .iter()
+        .map(|entry| {
+            json!({
+                "id": entry.id,
+                "link": entry.link,
+                "queued_by": entry.queued_by,
+                "queued_at": entry.queued_at.to_rfc3339(),
+            })
+        })
+        .collect();
+    json!({ "entries": entries, "total": state.queue_total })
 }
 
 pub fn app(playback_state: Arc<Mutex<PlaybackState>>) -> Router {
@@ -327,15 +347,22 @@ pub fn app(playback_state: Arc<Mutex<PlaybackState>>) -> Router {
             let mut interval = tokio::time::interval(Duration::from_secs(1));
             // the first tick is immediate; the loop sends the first status itself
             interval.tick().await;
+            let mut sent_queue_version = None;
             loop {
                 // armed before reading the state, so a change during the emit still wakes it
                 let notified = changed.notified();
                 if !s.connected() {
                     break;
                 }
-                let status = get_status(State(Arc::clone(&socket_state))).await;
-                s.emit("status", &status.to_string()).ok();
-                // every second, and right away when the link, loading or paused changes
+                // one snapshot for both, and the queue only after this status went out
+                let state = socket_state.lock().await.clone();
+                if s.emit("status", &status_json(&state).to_string()).is_ok()
+                    && sent_queue_version != Some(state.queue_version)
+                    && s.emit("queue", &queue_json(&state).to_string()).is_ok()
+                {
+                    sent_queue_version = Some(state.queue_version);
+                }
+                // every second, and right away when the song, queue, loading or paused changes
                 tokio::select! {
                     _ = interval.tick() => {}
                     _ = notified => {}
@@ -372,7 +399,9 @@ pub async fn resolve_host(host: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Song;
     use serde_json::Value;
+    use std::collections::VecDeque;
     use std::future::IntoFuture;
     use std::net::SocketAddr;
     use std::time::Instant;
@@ -540,9 +569,25 @@ mod tests {
     // playing `link` from now on, or idle with None
     fn new_state(link: Option<&str>) -> Arc<Mutex<PlaybackState>> {
         let mut state = PlaybackState::new();
-        state.set_link(link.map(String::from));
+        let song = link.map(|link| Song::new(link.to_string(), U, "tester".to_string()));
+        state.set_song(song.as_ref(), &VecDeque::new());
         state.loading = false;
         Arc::new(Mutex::new(state))
+    }
+
+    // queued songs https://youtu.be/<id>, queued by "tester"
+    fn queue_of(ids: &[u64]) -> VecDeque<Song> {
+        ids.iter()
+            .map(|&id| {
+                let mut song = Song::new(format!("https://youtu.be/{}", id), U, "tester".to_string());
+                song.id = Some(id);
+                song
+            })
+            .collect()
+    }
+
+    fn entry_ids(queue: &Value) -> Vec<u64> {
+        queue["entries"].as_array().unwrap().iter().map(|e| e["id"].as_u64().unwrap()).collect()
     }
 
     async fn serve(state: Arc<Mutex<PlaybackState>>) -> SocketAddr {
@@ -637,7 +682,9 @@ mod tests {
                 if let Some(event) = packet.strip_prefix("42") {
                     // the payload is a JSON string, not an object
                     let (name, payload): (String, String) = serde_json::from_str(event).unwrap();
-                    assert_eq!(name, "status");
+                    if name != "status" {
+                        continue;
+                    }
                     let status: Value = serde_json::from_str(&payload).unwrap();
                     assert_eq!(status["link"], "https://youtu.be/x");
                     statuses += 1;
@@ -657,10 +704,124 @@ mod tests {
         }
         // well before the next 1 s tick
         let start = Instant::now();
-        state.lock().await.set_link(Some("https://youtu.be/y".to_string()));
+        state.lock().await.set_song(Some(&Song::new("https://youtu.be/y".to_string(), U, "tester".to_string())), &VecDeque::new());
         let (_, body) = http(addr, "GET", &path, "").await;
         assert!(body.contains("youtu.be/y") && body.contains(r#"\"loading\":true"#), "{}", body);
         assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
+    }
+
+    // socket.io events (name, payload) in arrival order, until done says so; at most 5 s
+    async fn socket_events(
+        addr: SocketAddr,
+        path: &str,
+        done: impl Fn(&[(String, Value)]) -> bool,
+    ) -> Vec<(String, Value)> {
+        let start = Instant::now();
+        let mut events = Vec::new();
+        while !done(&events) {
+            assert!(start.elapsed() < Duration::from_secs(5), "timed out with {:?}", events);
+            let (_, body) = http(addr, "GET", path, "").await;
+            for packet in body.split('\x1e') {
+                if let Some(event) = packet.strip_prefix("42") {
+                    let (name, payload): (String, String) = serde_json::from_str(event).unwrap();
+                    events.push((name, serde_json::from_str(&payload).unwrap()));
+                }
+            }
+        }
+        events
+    }
+
+    fn has_queue(events: &[(String, Value)]) -> bool {
+        events.iter().any(|(name, _)| name == "queue")
+    }
+
+    #[test]
+    fn queue_snapshot_is_capped_and_only_versioned_on_change() {
+        let mut state = PlaybackState::new();
+        let queue = queue_of(&(1..=150).collect::<Vec<_>>());
+        state.set_queue(&queue);
+        assert_eq!((state.queue.len(), state.queue_total, state.queue_version), (100, 150, 1));
+        let json = queue_json(&state);
+        assert_eq!((entry_ids(&json)[99], json["total"].as_u64()), (100, Some(150)));
+        // the same queue again is not a change
+        state.set_queue(&queue);
+        assert_eq!(state.queue_version, 1);
+        // !stop
+        state.set_queue(&VecDeque::new());
+        assert_eq!((queue_json(&state), state.queue_version), (json!({"entries": [], "total": 0}), 2));
+    }
+
+    #[test]
+    fn a_song_start_is_one_update() {
+        let mut state = PlaybackState::new();
+        let mut queue = queue_of(&[1, 2]);
+        state.set_queue(&queue);
+        let next = queue.pop_front().unwrap();
+        state.set_song(Some(&next), &queue);
+        let status = status_json(&state);
+        assert_eq!(
+            (&status["link"], &status["entry_id"], &status["queued_by"], &status["loading"]),
+            (&json!("https://youtu.be/1"), &json!(1), &json!("tester"), &json!(true))
+        );
+        assert_eq!((entry_ids(&queue_json(&state)), state.queue_version), (vec![2], 2));
+        // a direct play has no entry id
+        let direct = Song::new("https://youtu.be/d".to_string(), U, "someone".to_string());
+        state.set_song(Some(&direct), &queue);
+        let status = status_json(&state);
+        assert_eq!((&status["entry_id"], &status["queued_by"]), (&Value::Null, &json!("someone")));
+        // nothing playing
+        state.set_song(None, &queue);
+        let status = status_json(&state);
+        assert_eq!((&status["link"], &status["entry_id"], &status["queued_by"]), (&json!(""), &Value::Null, &Value::Null));
+        assert_eq!(state.queue_version, 2);
+    }
+
+    #[tokio::test]
+    async fn socket_sends_the_queue_after_the_status_and_on_changes() {
+        let state = new_state(Some("https://youtu.be/now"));
+        state.lock().await.set_queue(&queue_of(&[1, 2]));
+        let addr = serve(Arc::clone(&state)).await;
+        let path = socket_connect(addr).await;
+
+        // connect: the status, then the full queue
+        let events = socket_events(addr, &path, has_queue).await;
+        assert_eq!(events[0].0, "status");
+        let queue = &events.iter().find(|(name, _)| name == "queue").unwrap().1;
+        assert_eq!((entry_ids(queue), &queue["total"]), (vec![1, 2], &json!(2)));
+        let entry = &queue["entries"][0];
+        assert_eq!((&entry["link"], &entry["queued_by"]), (&json!("https://youtu.be/1"), &json!("tester")));
+        assert!(chrono::DateTime::parse_from_rfc3339(entry["queued_at"].as_str().unwrap()).is_ok());
+
+        // a change goes out right away
+        let start = Instant::now();
+        state.lock().await.set_queue(&queue_of(&[2]));
+        let events = socket_events(addr, &path, has_queue).await;
+        assert!(start.elapsed() < Duration::from_millis(500), "{:?}", start.elapsed());
+        assert_eq!(entry_ids(&events.iter().find(|(name, _)| name == "queue").unwrap().1), vec![2]);
+
+        // an unchanged queue is not sent again, statuses keep coming
+        let start = Instant::now();
+        let events = socket_events(addr, &path, |_| start.elapsed() > Duration::from_millis(1500)).await;
+        assert!(events.iter().all(|(name, _)| name == "status"), "{:?}", events);
+    }
+
+    #[tokio::test]
+    async fn a_song_change_sends_the_status_before_the_queue_without_it() {
+        let state = new_state(Some("https://youtu.be/now"));
+        let mut queue = queue_of(&[1, 2]);
+        state.lock().await.set_queue(&queue);
+        let addr = serve(Arc::clone(&state)).await;
+        let path = socket_connect(addr).await;
+        socket_events(addr, &path, has_queue).await;
+
+        let next = queue.pop_front().unwrap();
+        state.lock().await.set_song(Some(&next), &queue);
+        let events = socket_events(addr, &path, has_queue).await;
+        let status_at = events.iter().position(|(name, v)| name == "status" && v["entry_id"] == 1).unwrap();
+        let queue_at = events.iter().position(|(name, _)| name == "queue").unwrap();
+        assert!(status_at < queue_at, "{:?}", events);
+        assert_eq!(events[status_at].1["link"], "https://youtu.be/1");
+        assert_eq!(entry_ids(&events[queue_at].1), vec![2]);
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -4,6 +4,7 @@ extern crate serde_json;
 mod helper;
 
 use anyhow::{bail, Result};
+use chrono::{DateTime, Utc};
 use futures::prelude::*;
 use log::{debug, error, info, warn};
 use serde::Deserialize;
@@ -88,12 +89,36 @@ struct Song {
     link: String,
     requester: ClientId,
     title: Option<String>,
+    // set when it enters the queue; the queue event and status.entry_id refer to it
+    id: Option<u64>,
+    queued_by: Option<String>,
+    queued_at: DateTime<Utc>,
 }
 
 impl Song {
+    fn new(link: String, requester: ClientId, queued_by: String) -> Self {
+        Song {
+            link,
+            requester,
+            title: None,
+            id: None,
+            queued_by: Some(queued_by),
+            queued_at: Utc::now(),
+        }
+    }
+
     fn name(&self) -> &str {
         self.title.as_deref().unwrap_or(&self.link)
     }
+}
+
+// what the queue event shows of a queued song
+#[derive(Clone, PartialEq)]
+struct QueueEntry {
+    id: u64,
+    link: String,
+    queued_by: Option<String>,
+    queued_at: DateTime<Utc>,
 }
 
 // Private chat replies, one at a time: the next waits until the server accepted the last, so a
@@ -173,7 +198,14 @@ struct PlaybackState {
     loading: bool,
     duration: u32,
     link: Option<String>,
-    // wakes the socket clients so they get a status right away
+    // the current song's queue entry id (None when it was played directly) and requester
+    entry_id: Option<u64>,
+    queued_by: Option<String>,
+    // the first MAX_QUEUE_ENTRIES of the queue, its full length, and a counter that changes with them
+    queue: Vec<QueueEntry>,
+    queue_total: usize,
+    queue_version: u64,
+    // wakes the socket clients so they get a status (and queue) right away
     changed: Arc<Notify>,
 }
 
@@ -186,6 +218,11 @@ impl PlaybackState {
             loading: false,
             duration: 0,
             link: None,
+            entry_id: None,
+            queued_by: None,
+            queue: Vec::new(),
+            queue_total: 0,
+            queue_version: 0,
             changed: Arc::new(Notify::new()),
         }
     }
@@ -199,19 +236,55 @@ impl PlaybackState {
         }
     }
 
-    // a new song starts loading, or nothing plays with None
-    fn set_link(&mut self, link: Option<String>) {
-        self.loading = link.is_some();
-        self.link = link;
+    // A new song starts loading (None: nothing plays) together with the queue without it. One
+    // update, so no socket client sees the next song gone from the queue but not yet playing.
+    fn set_song(&mut self, song: Option<&Song>, queue: &VecDeque<Song>) {
+        self.loading = song.is_some();
+        self.link = song.map(|song| song.link.clone());
+        self.entry_id = song.and_then(|song| song.id);
+        self.queued_by = song.and_then(|song| song.queued_by.clone());
         self.time_passed = 0.0;
         self.updated = Instant::now();
         self.paused = false;
         self.duration = 0;
+        self.update_queue(queue);
         self.changed.notify_waiters();
+    }
+
+    // the queue changed while the current song plays on
+    fn set_queue(&mut self, queue: &VecDeque<Song>) {
+        if self.update_queue(queue) {
+            self.changed.notify_waiters();
+        }
+    }
+
+    // returns whether the snapshot changed; only then does queue_version move
+    fn update_queue(&mut self, queue: &VecDeque<Song>) -> bool {
+        let entries: Vec<QueueEntry> = queue
+            .iter()
+            .take(MAX_QUEUE_ENTRIES)
+            .filter_map(|song| {
+                Some(QueueEntry {
+                    id: song.id?,
+                    link: song.link.clone(),
+                    queued_by: song.queued_by.clone(),
+                    queued_at: song.queued_at,
+                })
+            })
+            .collect();
+        if entries == self.queue && queue.len() == self.queue_total {
+            return false;
+        }
+        self.queue = entries;
+        self.queue_total = queue.len();
+        self.queue_version += 1;
+        true
     }
 }
 
 const DEFAULT_VOLUME: f32 = 0.2;
+// n0g shows at most this many; the queue event says how many there are in total
+const MAX_QUEUE_ENTRIES: usize = 100;
 const FRAME_SIZE: usize = 960;
 const FRAME: Duration = Duration::from_millis(20); // FRAME_SIZE samples at 48 kHz
 const MAX_PACKET_SIZE: usize = 3 * 1276;
@@ -360,18 +433,20 @@ async fn send_finished(pkt_send: &mpsc::Sender<AudioPacket>, played: bool, error
     }
 }
 
-// makes link the current song and starts play_file for it; returns the channel to control it
+// makes song the current one (queue is what's left waiting) and starts play_file for it; returns
+// the channel to control it
 async fn start_song(
-    link: &str,
+    song: &Song,
+    queue: &VecDeque<Song>,
     pkt_send: &mpsc::Sender<AudioPacket>,
     volume: f32,
     playback_state: &Arc<Mutex<PlaybackState>>,
 ) -> mpsc::Sender<PlayTaskCmd> {
-    // only the main loop sets the link, so a song change is one update with no idle gap between
-    playback_state.lock().await.set_link(Some(link.to_string()));
+    // only the main loop sets the song, so a song change is one update with no idle gap between
+    playback_state.lock().await.set_song(Some(song), queue);
     let (cmd_send, cmd_recv) = mpsc::channel(4);
     tokio::spawn(play_file(
-        link.to_string(),
+        song.link.clone(),
         pkt_send.clone(),
         cmd_recv,
         volume,
@@ -526,6 +601,7 @@ async fn real_main() -> Result<()> {
 
     let (mut cmd_send, _cmd_recv) = mpsc::channel(4);
     let mut play_queue: VecDeque<Song> = VecDeque::new();
+    let mut next_entry_id: u64 = 1;
     let mut outbox = Outbox::new();
 
     let playback_state = Arc::new(Mutex::new(PlaybackState::new()));
@@ -552,8 +628,8 @@ async fn real_main() -> Result<()> {
                                 target: _,
                                 message,
                             } => {
-                                if let Err(e) =
-                                    status_send.send(parse_command(&message, user.id)).await
+                                let action = parse_command(&message, user.id);
+                                if let Err(e) = status_send.send((action, user.name.to_string())).await
                                 {
                                     error!("Status packet sending error: {}", e);
                                 }
@@ -577,27 +653,34 @@ async fn real_main() -> Result<()> {
                 match val {
                     None => {
                     },
-                    Some(action) => {
+                    Some((action, nickname)) => {
                         match action {
                             Action::QueueNextAudio(link, user_id) if current.is_some() => {
                                 debug!("Queued next");
                                 outbox.push(user_id, format!("Playing next: {}", link));
-                                play_queue.push_front(Song { link, requester: user_id, title: None });
+                                let mut song = Song::new(link, user_id, nickname);
+                                song.id = Some(next_entry_id);
+                                next_entry_id += 1;
+                                play_queue.push_front(song);
+                                playback_state.lock().await.set_queue(&play_queue);
                             },
                             // when idle, queueing next means playing now
                             Action::PlayAudio(link, user_id) | Action::QueueNextAudio(link, user_id) => {
-                                let song = Song { link, requester: user_id, title: None };
+                                let mut song = Song::new(link, user_id, nickname);
                                 let msg = if current.is_none() {
                                     debug!("Playing");
                                     paused = false;
-                                    cmd_send = start_song(&song.link, &pkt_send, volume, &playback_state).await;
+                                    cmd_send = start_song(&song, &play_queue, &pkt_send, volume, &playback_state).await;
                                     let msg = format!("Loading {} ...", song.link);
                                     current = Some(song);
                                     msg
                                 } else {
                                     debug!("Queued");
                                     let msg = format!("Queued as #{}: {}", play_queue.len() + 1, song.link);
+                                    song.id = Some(next_entry_id);
+                                    next_entry_id += 1;
                                     play_queue.push_back(song);
+                                    playback_state.lock().await.set_queue(&play_queue);
                                     msg
                                 };
                                 outbox.push(user_id, msg);
@@ -657,6 +740,7 @@ async fn real_main() -> Result<()> {
                                     paused = false;
                                     let cleared = play_queue.len();
                                     play_queue.clear();
+                                    playback_state.lock().await.set_queue(&play_queue);
                                     let _ = cmd_send.send(PlayTaskCmd::Stop).await;
                                     match cleared {
                                         0 => "Stopped".to_string(),
@@ -734,10 +818,10 @@ async fn real_main() -> Result<()> {
                         match play_queue.pop_front() {
                             Some(song) => {
                                 paused = false;
-                                cmd_send = start_song(&song.link, &pkt_send, volume, &playback_state).await;
+                                cmd_send = start_song(&song, &play_queue, &pkt_send, volume, &playback_state).await;
                                 current = Some(song);
                             }
-                            None => playback_state.lock().await.set_link(None),
+                            None => playback_state.lock().await.set_song(None, &play_queue),
                         }
                     },
                 }
@@ -790,7 +874,8 @@ mod tests {
 
     fn player() -> Player {
         let mut state = PlaybackState::new();
-        state.set_link(Some("https://youtu.be/x".to_string()));
+        let song = Song::new("https://youtu.be/x".to_string(), ClientId(1), "tester".to_string());
+        state.set_song(Some(&song), &VecDeque::new());
         let state = Arc::new(Mutex::new(state));
         let (frames, mut frame_recv) = mpsc::channel(1000);
         let (pkt_send, packets) = mpsc::channel(1000);
