@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, Mutex, Notify};
 use tokio::time::{sleep_until, Duration, Instant};
 
 use crate::helper::{
-    app, check_dependencies, cleanup_process, connect_to_ts, failure_message, format_duration,
+    app, check_dependencies, cleanup_process, connect_to_ts, failure_message, format_duration, is_link,
     now_playing_message, parse_command, read_config, read_info_json, resolve_host,
     send_ts_message, ytdlp_args,
 };
@@ -438,7 +438,7 @@ async fn play_file(
 
 // A search (anything but an http(s) link) shows as the page yt-dlp found; links stay as queued.
 fn resolved_link(link: &str, info_json: &InfoJson) -> Option<String> {
-    if link.starts_with("http://") || link.starts_with("https://") {
+    if is_link(link) {
         return None;
     }
     info_json.webpage_url.clone()
@@ -796,7 +796,7 @@ async fn real_main() -> Result<()> {
                             },
                             Action::Help(user_id) => {
                                 debug!("Help");
-                                let msg = "\nCommands:\n!play <link> or !yt <link> - Play audio from link or queue if already playing\n!next <link> or !n <link> - Queue a track as the next track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip, !s, !next, or !n - Skip current track\n!stop - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume (modifier should be a number from 0 to 100)\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
+                                let msg = "\nCommands:\n!play <link or search> or !yt <link or search> - Play a link or the first YouTube result, or queue it if already playing\n!next <link or search> or !n <link or search> - Queue a track as the next track\n!pause or !p - Pause current track\n!resume, !r, !continue, or !c - Resume current track\n!skip, !s, !next, or !n - Skip current track\n!stop - Stop all tracks\n!volume <modifier> or !v <modifier> - Change volume (modifier should be a number from 0 to 100)\n!info or !i - Get info about current track\n!help or !h - Get this message\n!quit or !q - Quit\n".to_owned();
                                 outbox.push(user_id, msg);
                             },
                             Action::Quit => {

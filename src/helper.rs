@@ -77,6 +77,10 @@ pub fn read_info_json() -> Result<InfoJson> {
     Ok(info_json)
 }
 
+pub fn is_link(s: &str) -> bool {
+    s.starts_with("http://") || s.starts_with("https://")
+}
+
 pub fn ytdlp_args(link: &str, cookies: bool) -> Vec<&str> {
     let mut args = vec![
         "--quiet",
@@ -91,6 +95,9 @@ pub fn ytdlp_args(link: &str, cookies: bool) -> Vec<&str> {
         "5",
         "--write-info-json",
         "--no-playlist",
+        // what isn't a link is a search
+        "--default-search",
+        "ytsearch",
         "--output",
         "-",
     ];
@@ -222,6 +229,11 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
     }
 
     let split_vec: Vec<&str> = sanitized.split_whitespace().collect();
+    // a link plays as is; anything else is a YouTube search for the whole rest of the message
+    let target = match split_vec.get(1) {
+        Some(first) if is_link(first) => first.to_string(),
+        _ => split_vec.get(1..).unwrap_or_default().join(" "),
+    };
 
     if split_vec[0] == "!stop" {
         info!("Stopping all tracks (requested by {})", user_id);
@@ -242,8 +254,8 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
 
     if split_vec[0] == "!next" || split_vec[0] == "!n" {
         if split_vec.len() > 1 {
-            info!("Queueing: {} (requested by {})", split_vec[1], user_id);
-            return Action::QueueNextAudio(split_vec[1].to_string(), user_id);
+            info!("Queueing: {} (requested by {})", target, user_id);
+            return Action::QueueNextAudio(target, user_id);
         }
         info!("Skipping (requested by {})", user_id);
         return Action::Skip(user_id);
@@ -295,8 +307,8 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
     }
 
     if split_vec[0] == "!yt" || split_vec[0] == "!play" {
-        info!("Playing: {} (requested by {})", split_vec[1], user_id);
-        return Action::PlayAudio(split_vec[1].to_string(), user_id);
+        info!("Playing: {} (requested by {})", target, user_id);
+        return Action::PlayAudio(target, user_id);
     }
 
     Action::None
@@ -479,6 +491,21 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_searches_for_anything_but_a_link() {
+        let play = |link: &str| Action::PlayAudio(link.to_string(), U);
+        assert_eq!(parse_command("!play tetris theme", U), play("tetris theme"));
+        assert_eq!(parse_command("!yt  tetris\t theme ", U), play("tetris theme"));
+        assert_eq!(parse_command("!play ytsearch:tetris theme", U), play("ytsearch:tetris theme"));
+        assert_eq!(parse_command("!play dQw4w9WgXcQ", U), play("dQw4w9WgXcQ"));
+        // a link is the first word only, as before
+        assert_eq!(parse_command("!play https://youtu.be/x please", U), play("https://youtu.be/x"));
+        assert_eq!(
+            parse_command("!n tetris theme", U),
+            Action::QueueNextAudio("tetris theme".to_string(), U)
+        );
+    }
+
+    #[test]
     fn parse_command_volume() {
         let volume = |modifier| Action::ChangeVolume { modifier, user_id: U };
         assert_eq!(parse_command("!v", U), volume(-1.0));
@@ -564,6 +591,8 @@ mod tests {
         assert!(args.contains(&"--write-info-json"));
         // without it a Mix link (watch?v=..&list=..) streams the whole playlist as one song
         assert!(args.contains(&"--no-playlist"));
+        // !play <words> searches YouTube
+        assert!(args.windows(2).any(|w| w == ["--default-search", "ytsearch"]));
         // "--" keeps a link like "-x" from being parsed as an option
         assert_eq!(args[args.len() - 2..], ["--", "-x"]);
         assert!(!args.contains(&"--cookies"));

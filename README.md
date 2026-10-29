@@ -116,8 +116,8 @@ Use the following commands in your TeamSpeak 3 server to control the bot.
 
 | Command                                 | Description                                   |
 |-----------------------------------------|-----------------------------------------------|
-| `!play <media_url>` / `!yt <media_url>` | Play audio from the provided URL or queue it. |
-| `!next <media_url>` / `!n <media_url>`  | Queue a track to play next.                   |
+| `!play <link or search>` / `!yt …`     | Play a link, or search YouTube for the words and play the first result; queued if something plays. |
+| `!next <link or search>` / `!n …`      | Queue a track to play next.                   |
 | `!pause` / `!p`                         | Pause the current track.                      |
 | `!resume` / `!r` / `!continue` / `!c`   | Resume paused playback.                       |
 | `!skip` / `!s` / `!next` / `!n`         | Skip the current track.                       |
