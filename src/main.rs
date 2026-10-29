@@ -50,6 +50,8 @@ struct InfoJson {
     #[serde(default)]
     channel: String,
     duration: Option<f64>,
+    // the page yt-dlp played; for a search that's the video it found
+    webpage_url: Option<String>,
 }
 
 #[derive(Debug, PartialEq)]
@@ -379,6 +381,7 @@ async fn play_file(
     let mut ffmpeg_stdout = ffmpeg.stdout.take().unwrap();
     let reader_state = Arc::clone(&playback_state);
     let started_send = pkt_send.clone();
+    let reader_link = link.clone();
     let reader = tokio::spawn(async move {
         let mut pcm: Pcm = [0; FRAME_SIZE * 4];
         let mut first_frame = true;
@@ -396,7 +399,13 @@ async fn play_file(
                 // yt-dlp writes this song's info.json before it starts downloading
                 let info_json = read_info_json().ok();
                 if let Some(info_json) = &info_json {
-                    reader_state.lock().await.duration = info_json.duration.unwrap_or(0.0) as u32;
+                    let mut state = reader_state.lock().await;
+                    state.duration = info_json.duration.unwrap_or(0.0) as u32;
+                    // before the first frame, so the status that ends loading already has it; play_file
+                    // finishes before the main loop changes songs, so this can't hit the next song
+                    if let Some(url) = resolved_link(&reader_link, info_json) {
+                        state.link = Some(url);
+                    }
                 }
                 let _ = started_send.send(AudioPacket::Started(info_json)).await;
             }
@@ -427,6 +436,14 @@ async fn play_file(
     send_finished(&pkt_send, played, error).await;
 }
 
+// A search (anything but an http(s) link) shows as the page yt-dlp found; links stay as queued.
+fn resolved_link(link: &str, info_json: &InfoJson) -> Option<String> {
+    if link.starts_with("http://") || link.starts_with("https://") {
+        return None;
+    }
+    info_json.webpage_url.clone()
+}
+
 async fn send_finished(pkt_send: &mpsc::Sender<AudioPacket>, played: bool, error: Option<String>) {
     if let Err(e) = pkt_send.send(AudioPacket::Finished { played, error }).await {
         error!("Status packet sending error: {}", e);
@@ -442,7 +459,7 @@ async fn start_song(
     volume: f32,
     playback_state: &Arc<Mutex<PlaybackState>>,
 ) -> mpsc::Sender<PlayTaskCmd> {
-    // only the main loop sets the song, so a song change is one update with no idle gap between
+    // only the main loop changes songs, so a song change is one update with no idle gap between
     playback_state.lock().await.set_song(Some(song), queue);
     let (cmd_send, cmd_recv) = mpsc::channel(4);
     tokio::spawn(play_file(
@@ -973,6 +990,24 @@ mod tests {
         let at = p.sent(10).await;
         assert_eq!(at[9] - at[0], FRAME * 9);
         assert_eq!(p.status().await, (position(played + 9), false, false));
+    }
+
+    #[test]
+    fn searches_show_the_page_yt_dlp_found() {
+        let found = InfoJson {
+            title: "Tetris Theme".to_string(),
+            channel: String::new(),
+            duration: Some(90.0),
+            webpage_url: Some("https://www.youtube.com/watch?v=NmCCQxVBfyM".to_string()),
+        };
+        for link in ["ytsearch:tetris", "tetris"] {
+            assert_eq!(resolved_link(link, &found).as_deref(), Some("https://www.youtube.com/watch?v=NmCCQxVBfyM"), "{}", link);
+        }
+        // links stay exactly as queued, t= and all
+        for link in ["https://www.youtube.com/watch?v=NmCCQxVBfyM&t=30s", "http://media/song.mp3"] {
+            assert_eq!(resolved_link(link, &found), None, "{}", link);
+        }
+        assert_eq!(resolved_link("ytsearch:x", &InfoJson { webpage_url: None, ..found }), None);
     }
 
     fn flooding() -> Result<(), CommandError> {

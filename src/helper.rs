@@ -245,10 +245,12 @@ pub fn parse_command(msg: &str, user_id: ClientId) -> Action {
             info!("Queueing: {} (requested by {})", split_vec[1], user_id);
             return Action::QueueNextAudio(split_vec[1].to_string(), user_id);
         }
+        info!("Skipping (requested by {})", user_id);
         return Action::Skip(user_id);
     }
 
     if split_vec[0] == "!skip" || split_vec[0] == "!s" {
+        info!("Skipping (requested by {})", user_id);
         return Action::Skip(user_id);
     }
 
@@ -495,6 +497,8 @@ mod tests {
         assert_eq!((live.channel.as_str(), live.duration), ("Lofi Girl", None));
         let direct: InfoJson = serde_json::from_str(DIRECT_LINK).unwrap();
         assert_eq!((direct.title.as_str(), direct.channel.as_str(), direct.duration), ("song", "", None));
+        assert_eq!(video.webpage_url.as_deref(), Some("https://www.youtube.com/watch?v=iHsz6jzjbRc"));
+        assert_eq!(direct.webpage_url.as_deref(), Some("http://127.0.0.1:8000/song.mp3"));
     }
 
     #[test]
